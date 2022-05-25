@@ -1,6 +1,6 @@
 {
   "name": "@parcel/lsp",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "license": "MIT",
   "publishConfig": {
     "access": "public"
@@ -29,10 +29,10 @@
   },
   "dependencies": {
     "vscode-languageserver-textdocument": "^1.0.0",
-    "@parcel/diagnostic": "2.5.0",
-    "@parcel/types": "2.5.0",
-    "@parcel/plugin": "2.5.0",
-    "@parcel/utils": "2.5.0",
+    "@parcel/diagnostic": "2.6.0",
+    "@parcel/types": "2.6.0",
+    "@parcel/plugin": "2.6.0",
+    "@parcel/utils": "2.6.0",
     "@parcel/watcher": "2.0.5",
     "node-ipc": "^9.1.4",
     "nullthrows": "^1.1.1",
