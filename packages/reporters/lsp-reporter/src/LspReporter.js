@@ -58,13 +58,13 @@ export default (new Reporter({
           });
           ipc.server.on(
             'onDefinition',
-            async ({document, word, id}, socket) => {
+            async ({document, word, position, id}, socket) => {
               let bundleGraph = await lastBundleGraph.promise;
-              let result = onDefinition(bundleGraph, document, word);
+              let result = onDefinition(bundleGraph, document, word, position);
               ipc.server.emit(socket, 'onDefinition', {
                 id,
-                document: result.document,
-                range: result.range,
+                document: result?.document,
+                range: result?.range,
               });
             },
           );
@@ -283,12 +283,15 @@ function onDefinition(
   bundleGraph: BundleGraph<PackagedBundle>,
   document: string,
   word: string,
+  // eslint-disable-next-line no-unused-vars
+  position: {|line: number, character: number|},
 ) {
   let assetFileName = url.fileURLToPath(document);
+  let ext = path.extname(assetFileName).slice(1);
   let asset = nullthrows(
     bundleGraph.traverseBundles((bundle, context, actions) => {
       let asset = bundle.traverseAssets((asset, context, actions) => {
-        if (asset.filePath === assetFileName) {
+        if (asset.filePath === assetFileName && asset.type === ext) {
           actions.stop();
           return asset;
         }
@@ -308,7 +311,6 @@ function onDefinition(
             nullthrows(bundleGraph.getResolvedAsset(dep)),
             sym,
           );
-          console.log(resolution);
           if (resolution) {
             return {
               document: url.pathToFileURL(resolution.asset.filePath).href,
@@ -328,18 +330,4 @@ function onDefinition(
       }
     }
   }
-
-  return {
-    document: url.pathToFileURL(asset.filePath).href,
-    range: {
-      start: {
-        line: 1,
-        character: 0,
-      },
-      end: {
-        line: 1,
-        character: 5,
-      },
-    },
-  };
 }

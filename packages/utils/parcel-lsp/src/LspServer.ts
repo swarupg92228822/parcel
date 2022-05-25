@@ -113,14 +113,16 @@ connection.onDefinition((documentDefinitionParams, token) => {
       start: {line: position.line, character: position.character},
       end: {line: position.line, character: position.character},
     };
+    let regex = document.languageId === 'css' ? /[\w-]/ : /[\w]/;
+
     while (
       range.start.character > 0 &&
-      /[\w]/.test(line.charAt(range.start.character - 1))
+      regex.test(line.charAt(range.start.character - 1))
     )
       --range.start.character;
     while (
       range.end.character < line.length - 1 &&
-      /[\w]/.test(line.charAt(range.end.character))
+      regex.test(line.charAt(range.end.character))
     )
       ++range.end.character;
 
@@ -132,12 +134,16 @@ connection.onDefinition((documentDefinitionParams, token) => {
       let cb = (response: {document: string; id: string; range: Range}) => {
         if (response.id === id) {
           channel.off('onDefinition', cb);
-          resolve(Location.create(response.document, response.range));
+          if (response.document && response.range) {
+            resolve(Location.create(response.document, response.range));
+          } else {
+            resolve(undefined);
+          }
         }
       };
       channel.on('onDefinition', cb);
 
-      channel.emit('onDefinition', {document: uri, word, id});
+      channel.emit('onDefinition', {document: uri, word, position, id});
     });
   }
 });

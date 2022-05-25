@@ -1,4 +1,5 @@
 .button {
-  /* background: var(--accent-color from './vars.module.css'); */
+  background: var(--accent-color from './vars.module.css');
+
   color: red;
 }
