@@ -2,7 +2,7 @@
 /* eslint-disable no-console */
 
 import type {Diagnostic as ParcelDiagnostic} from '@parcel/diagnostic';
-import type {FilePath} from '@parcel/types';
+import type {PackagedBundle, FilePath, BundleGraph} from '@parcel/types';
 
 import {DiagnosticSeverity} from 'vscode-languageserver/node';
 
@@ -12,10 +12,13 @@ import invariant from 'assert';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
+import url from 'url';
 import ps from 'ps-node';
 import {promisify} from 'util';
 import ipc from 'node-ipc';
 import {getProgressMessage} from '../../cli/src/utils';
+import {makeDeferredWithPromise, type Deferred} from '@parcel/utils';
+import nullthrows from 'nullthrows';
 
 const lookupPid = promisify(ps.lookup);
 
@@ -29,6 +32,8 @@ let fileDiagnostics: DefaultMap<string, Array<LspDiagnostic>> = new DefaultMap(
   () => [],
 );
 let pipeFilename;
+
+let lastBundleGraph = makeDeferredWithPromise<BundleGraph<PackagedBundle>>();
 
 export default (new Reporter({
   async report({event, logger, options}) {
@@ -51,6 +56,18 @@ export default (new Reporter({
               }),
             );
           });
+          ipc.server.on(
+            'onDefinition',
+            async ({document, word, id}, socket) => {
+              let bundleGraph = await lastBundleGraph.promise;
+              let result = onDefinition(bundleGraph, document, word);
+              ipc.server.emit(socket, 'onDefinition', {
+                id,
+                document: result.document,
+                range: result.range,
+              });
+            },
+          );
         });
         ipc.server.start();
 
@@ -99,6 +116,7 @@ export default (new Reporter({
           fileDiagnostics: [...fileDiagnostics].map(([uri]) => [uri, []]),
         });
         fileDiagnostics.clear();
+        lastBundleGraph = makeDeferredWithPromise();
         break;
       }
       case 'buildSuccess':
@@ -107,6 +125,7 @@ export default (new Reporter({
           type: 'parcelFileDiagnostics',
           fileDiagnostics: [...fileDiagnostics],
         });
+        lastBundleGraph.deferred.resolve(event.bundleGraph);
         break;
       case 'buildFailure': {
         updateDiagnostics(
@@ -258,4 +277,69 @@ function normalizeFilePath(filePath: FilePath, projectRoot: FilePath) {
   return path.isAbsolute(filePath)
     ? filePath
     : path.join(projectRoot, filePath);
+}
+
+function onDefinition(
+  bundleGraph: BundleGraph<PackagedBundle>,
+  document: string,
+  word: string,
+) {
+  let assetFileName = url.fileURLToPath(document);
+  let asset = nullthrows(
+    bundleGraph.traverseBundles((bundle, context, actions) => {
+      let asset = bundle.traverseAssets((asset, context, actions) => {
+        if (asset.filePath === assetFileName) {
+          actions.stop();
+          return asset;
+        }
+      });
+      if (asset) {
+        actions.stop();
+        return asset;
+      }
+    }),
+  );
+
+  for (let dep of asset.getDependencies()) {
+    if (dep.symbols.hasLocalSymbol(word)) {
+      for (let [sym, symbol] of dep.symbols) {
+        if (symbol.local === word) {
+          let resolution = bundleGraph.getSymbolResolution(
+            nullthrows(bundleGraph.getResolvedAsset(dep)),
+            sym,
+          );
+          console.log(resolution);
+          if (resolution) {
+            return {
+              document: url.pathToFileURL(resolution.asset.filePath).href,
+              range: {
+                start: {
+                  line: nullthrows(resolution.loc).start.line - 1,
+                  character: nullthrows(resolution.loc).start.column - 1,
+                },
+                end: {
+                  line: nullthrows(resolution.loc).end.line - 1,
+                  character: nullthrows(resolution.loc).end.column,
+                },
+              },
+            };
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    document: url.pathToFileURL(asset.filePath).href,
+    range: {
+      start: {
+        line: 1,
+        character: 0,
+      },
+      end: {
+        line: 1,
+        character: 5,
+      },
+    },
+  };
 }

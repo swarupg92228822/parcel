@@ -16,6 +16,9 @@ import {
   TextDocumentPositionParams,
   TextDocumentSyncKind,
   InitializeResult,
+  Location,
+  Range,
+  Position,
   WorkDoneProgressServerReporter,
 } from 'vscode-languageserver/node';
 
@@ -66,10 +69,7 @@ connection.onInitialize((params: InitializeParams) => {
   const result: InitializeResult = {
     capabilities: {
       textDocumentSync: TextDocumentSyncKind.Incremental,
-      // Tell the client that this server supports code completion.
-      completionProvider: {
-        resolveProvider: true,
-      },
+      definitionProvider: true,
     },
   };
 
@@ -94,6 +94,50 @@ connection.onInitialized(() => {
   if (hasWorkspaceFolderCapability) {
     connection.workspace.onDidChangeWorkspaceFolders(_event => {
       connection.console.log('Workspace folder change event received.');
+    });
+  }
+});
+
+connection.onDefinition((documentDefinitionParams, token) => {
+  let uri = documentDefinitionParams.textDocument.uri;
+  let position = documentDefinitionParams.position;
+  let client = [...clients.values()][0];
+  let document = documents.get(uri);
+
+  if (client && document) {
+    let line = document.getText({
+      start: {line: position.line, character: 0},
+      end: {line: position.line, character: Number.MAX_VALUE},
+    });
+    let range = {
+      start: {line: position.line, character: position.character},
+      end: {line: position.line, character: position.character},
+    };
+    while (
+      range.start.character > 0 &&
+      /[\w]/.test(line.charAt(range.start.character - 1))
+    )
+      --range.start.character;
+    while (
+      range.end.character < line.length - 1 &&
+      /[\w]/.test(line.charAt(range.end.character))
+    )
+      ++range.end.character;
+
+    let word = document.getText(range);
+    let channel = client.client.of[client.transportName];
+
+    return new Promise(resolve => {
+      let id = String(Math.random());
+      let cb = (response: {document: string; id: string; range: Range}) => {
+        if (response.id === id) {
+          channel.off('onDefinition', cb);
+          resolve(Location.create(response.document, response.range));
+        }
+      };
+      channel.on('onDefinition', cb);
+
+      channel.emit('onDefinition', {document: uri, word, id});
     });
   }
 });
@@ -135,7 +179,7 @@ class ProgressReporter {
 function createIPCClientIfPossible(
   parcelLspDir: string,
   filePath: string,
-): {client: IPCType; uris: Set<string>} | undefined {
+): {client: IPCType; transportName: string; uris: Set<string>} | undefined {
   let transportName: string;
   try {
     transportName = JSON.parse(
@@ -189,11 +233,14 @@ function createIPCClientIfPossible(
     );
   });
 
-  return {client, uris};
+  return {client, transportName, uris};
 }
 
 let progressReporter = new ProgressReporter();
-let clients: Map<string, {client: IPCType; uris: Set<string>}> = new Map();
+let clients: Map<
+  string,
+  {client: IPCType; transportName: string; uris: Set<string>}
+> = new Map();
 let parcelLspDir = path.join(fs.realpathSync(os.tmpdir()), 'parcel-lsp');
 fs.mkdirSync(parcelLspDir, {recursive: true});
 // Search for currently running Parcel processes in the parcel-lsp dir.
@@ -236,4 +283,5 @@ watcher.subscribe(parcelLspDir, async (err, events) => {
   }
 });
 
+documents.listen(connection);
 connection.listen();
