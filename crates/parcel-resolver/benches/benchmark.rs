@@ -229,10 +229,7 @@ fn bench_cached(c: &mut Criterion) {
   let from = root.join("foo.js");
   let fs: Arc<dyn parcel_resolver::FileSystem> = Arc::new(parcel_resolver::OsFileSystem::default());
   let cache = parcel_resolver::Cache::new(Arc::clone(&fs));
-  let resolver = parcel_resolver::Resolver::node_esm(
-    Path::new("/Users/devongovett/Downloads/bench-resolver-main"),
-    &cache,
-  );
+  let resolver = parcel_resolver::Resolver::node_esm(&root, &cache);
   c.bench_function("cached/parcel_resolver", |b| {
     b.iter(|| parcel(&from, &resolver))
   });
