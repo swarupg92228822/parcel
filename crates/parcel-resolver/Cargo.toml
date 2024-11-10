@@ -23,6 +23,17 @@ rustc-hash = "2.0.0"
 
 [dev-dependencies]
 assert_fs = "1.0"
+oxc_resolver = "2"
+node_resolver = "0.15.0"
+criterion = { version = "*", features = ["html_reports"] }
+url = "*"
+deno_package_json = "*"
+rspack_resolver = "*"
 
 [target.'cfg(windows)'.dev-dependencies]
 is_elevated = "0.1.2"
+
+
+[[bench]]
+name = "benchmark"
+harness = false
