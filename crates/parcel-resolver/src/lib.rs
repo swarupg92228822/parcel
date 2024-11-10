@@ -1,3 +1,44 @@
+//! parcel-resolver implements the Node.js module resolution algorithm.
+//! It supports both CommonJS and ES module resolution, along with many
+//! additional features supported by various tools in the JavaScript ecosystem,
+//! such as TypeScript's tsconfig paths and extension rewriting, the "alias"
+//! and "browser" fields used by bundlers, absolute and tilde paths, and more.
+//! These can be individually turned on or off using feature flags.
+//!
+//! For a full description of all supported resolution features, see [Parcel's documentation](https://parceljs.org/features/dependency-resolution/).
+//!
+//! # Example
+//!
+//! To create a resolver, first create a [Cache]. This stores information about the files
+//! in a [FileSystem], and can be reused between multiple resolvers. A fresh cache
+//! should generally be created once per build to ensure information is up to date.
+//!
+//! Next, create a [Resolver] using one of the constructors. For example, `Resolver::node`
+//! creates a Node.js compatible CommonJS resolver, `Resolver::node_esm` creates an ESM resolver,
+//! and `Resolver::parcel` creates a Parcel-compatible resolver. From there you can customize individual
+//! features such as extensions or index files by setting properties on the resolver.
+//!
+//! Finally, call `resolver.resolve` to resolve a specifier. This returns a result, along with [Invalidations]
+//! describing the files that should invalidate any resolution caches.
+//!
+//! ```
+//! use parcel_resolver::{Cache, Resolver, SpecifierType, ResolutionAndQuery};
+//! use std::path::Path;
+//!
+//! let cache = Cache::default();
+//! let resolver = Resolver::node_esm(Path::new("/path/to/project-root"), &cache);
+//!
+//! let res = resolver.resolve(
+//!   "lodash",
+//!   Path::new("/path/to/project-root/index.js"),
+//!   SpecifierType::Esm
+//! );
+//!
+//! if let Ok(ResolutionAndQuery { resolution, query }) = res.result {
+//!   // Do something with the resolution!
+//! }
+//! ```
+
 use std::{
   borrow::Cow,
   cell::OnceCell,
@@ -8,8 +49,9 @@ use std::{
 
 use bitflags::bitflags;
 
+use cache::private::CacheCow;
+pub use cache::Cache;
 use cache::CachedPath;
-pub use cache::{Cache, CacheCow};
 pub use error::ResolverError;
 #[cfg(not(target_arch = "wasm32"))]
 pub use fs::OsFileSystem;
@@ -17,9 +59,8 @@ pub use fs::{FileKind, FileSystem};
 pub use invalidations::*;
 use package_json::{AliasValue, ExportsResolution, PackageJson};
 pub use package_json::{ExportsCondition, Fields, ModuleType, PackageJsonError};
-pub use specifier::{
-  parse_package_specifier, parse_scheme, Specifier, SpecifierError, SpecifierType,
-};
+use specifier::{parse_package_specifier, parse_scheme};
+pub use specifier::{Specifier, SpecifierError, SpecifierType};
 use tsconfig::TsConfigWrapper;
 
 mod builtins;
@@ -27,12 +68,14 @@ mod cache;
 mod error;
 mod fs;
 mod invalidations;
+mod json_comments_rs;
 mod package_json;
 mod specifier;
 mod tsconfig;
 mod url_to_path;
 
 bitflags! {
+  /// Resolution features to enable.
   pub struct Flags: u16 {
     /// Parcel-style absolute paths resolved relative to project root.
     const ABSOLUTE_SPECIFIERS = 1 << 0;
@@ -67,10 +110,14 @@ bitflags! {
   }
 }
 
+/// Describes which modules in node_modules should be resolved.
 #[derive(Clone)]
 pub enum IncludeNodeModules {
+  /// Whether or not to include all node_modules.
   Bool(bool),
+  /// An array of node_modules to include.
   Array(Vec<String>),
+  /// A mapping of node_modules and whether to include them.
   Map(HashMap<String, bool>),
 }
 
@@ -82,18 +129,28 @@ impl Default for IncludeNodeModules {
 
 type ResolveModuleDir = dyn Fn(&str, &Path) -> Result<PathBuf, ResolverError> + Send + Sync;
 
+/// Implements the Node.js module resolution algorithm.
 pub struct Resolver<'a> {
+  /// The root path of the project.
   pub project_root: CachedPath,
+  /// A list of file extensions to try when resolving.
   pub extensions: Extensions<'a>,
+  /// A file name (without extension) for the index file of a directory.
   pub index_file: &'a str,
+  /// package.json entry fields to try.
   pub entries: Fields,
+  /// Resolution features to enable.
   pub flags: Flags,
+  /// Configures which node_modules should be resolved.
   pub include_node_modules: Cow<'a, IncludeNodeModules>,
+  /// package.json "exports" conditions to enable.
   pub conditions: ExportsCondition,
+  /// A custom module directory resolution function, e.g. Yarn PnP.
   pub module_dir_resolver: Option<Arc<ResolveModuleDir>>,
-  pub cache: CacheCow<'a>,
+  cache: CacheCow<'a>,
 }
 
+/// A list of file extensions to try when resolving.
 pub enum Extensions<'a> {
   Borrowed(&'a [&'a str]),
   Owned(Vec<String>),
@@ -108,12 +165,16 @@ impl<'a> Extensions<'a> {
   }
 }
 
+/// Options for individual resolution requests.
 #[derive(Default, Debug)]
 pub struct ResolveOptions {
+  /// Known condition flags.
   pub conditions: ExportsCondition,
+  /// Custom conditions.
   pub custom_conditions: Vec<String>,
 }
 
+/// Describes the result of a resolution request.
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize)]
 #[serde(tag = "type", content = "value")]
 pub enum Resolution {
@@ -129,13 +190,27 @@ pub enum Resolution {
   Global(String),
 }
 
+/// The resolved path and query string from the original specifier, if any.
+#[derive(Debug, PartialEq, Eq, Clone, serde::Serialize)]
+pub struct ResolutionAndQuery {
+  /// The result of the resolution request.
+  pub resolution: Resolution,
+  /// The query string from the original specifier, if any.
+  pub query: Option<String>,
+}
+
+/// The result of a resolution request, and list of files that should invalidate the cache.
 pub struct ResolveResult {
-  pub result: Result<(Resolution, Option<String>), ResolverError>,
+  /// The resolution result.
+  pub result: Result<ResolutionAndQuery, ResolverError>,
+  /// List of files that should invalidate the cache.
   pub invalidations: Invalidations,
 }
 
 impl<'a> Resolver<'a> {
-  pub fn node(project_root: Cow<'a, Path>, cache: CacheCow<'a>) -> Self {
+  /// Creates a resolver with Node.js CommonJS settings.
+  pub fn node<C: Into<CacheCow<'a>>>(project_root: &Path, cache: C) -> Self {
+    let cache: CacheCow = cache.into();
     Self {
       project_root: cache.get(&project_root),
       extensions: Extensions::Borrowed(&["js", "json", "node"]),
@@ -149,7 +224,9 @@ impl<'a> Resolver<'a> {
     }
   }
 
-  pub fn node_esm(project_root: Cow<'a, Path>, cache: CacheCow<'a>) -> Self {
+  /// Creates a resolver with Node.js ESM settings.
+  pub fn node_esm<C: Into<CacheCow<'a>>>(project_root: &Path, cache: C) -> Self {
+    let cache: CacheCow = cache.into();
     Self {
       project_root: cache.get(&project_root),
       extensions: Extensions::Borrowed(&[]),
@@ -163,7 +240,9 @@ impl<'a> Resolver<'a> {
     }
   }
 
-  pub fn parcel(project_root: Cow<'a, Path>, cache: CacheCow<'a>) -> Self {
+  /// Creates a resolver with Parcel settings.
+  pub fn parcel<C: Into<CacheCow<'a>>>(project_root: &Path, cache: C) -> Self {
+    let cache: CacheCow = cache.into();
     Self {
       project_root: cache.get(&project_root),
       extensions: Extensions::Borrowed(&["mjs", "js", "jsx", "cjs", "json"]),
@@ -177,6 +256,7 @@ impl<'a> Resolver<'a> {
     }
   }
 
+  /// Resolves a specifier relative to the given path, with default options.
   pub fn resolve(
     &self,
     specifier: &str,
@@ -186,6 +266,7 @@ impl<'a> Resolver<'a> {
     self.resolve_with_options(specifier, from, specifier_type, Default::default())
   }
 
+  /// Resolves a specifier relative to the given path, with custom options.
   pub fn resolve_with_options(
     &self,
     specifier: &str,
@@ -203,6 +284,7 @@ impl<'a> Resolver<'a> {
     }
   }
 
+  /// Resolves a specifier with pre-existing Invalidations.
   pub fn resolve_with_invalidations(
     &self,
     specifier: &str,
@@ -210,7 +292,7 @@ impl<'a> Resolver<'a> {
     specifier_type: SpecifierType,
     invalidations: &Invalidations,
     options: ResolveOptions,
-  ) -> Result<(Resolution, Option<String>), ResolverError> {
+  ) -> Result<ResolutionAndQuery, ResolverError> {
     let (specifier, query) = match Specifier::parse(specifier, specifier_type, self.flags) {
       Ok(s) => s,
       Err(e) => return Err(e.into()),
@@ -224,11 +306,15 @@ impl<'a> Resolver<'a> {
     }
 
     match request.resolve() {
-      Ok(r) => Ok((r, query.map(|q| q.to_owned()))),
+      Ok(r) => Ok(ResolutionAndQuery {
+        resolution: r,
+        query: query.map(|q| q.to_owned()),
+      }),
       Err(r) => Err(r),
     }
   }
 
+  /// Returns whether the given path has side effects, according to its parent package.json.
   pub fn resolve_side_effects(
     &self,
     path: &Path,
@@ -242,6 +328,8 @@ impl<'a> Resolver<'a> {
     }
   }
 
+  /// Returns the module type (CommonJS, ESM, or JSON) of the given path,
+  /// according to either its extension or the package.json `type` field.
   pub fn resolve_module_type(
     &self,
     path: &Path,
@@ -315,6 +403,11 @@ impl<'a> Resolver<'a> {
     }
 
     None
+  }
+
+  /// Returns the resolution cache.
+  pub fn cache(&self) -> &Cache {
+    &self.cache
   }
 }
 
@@ -1302,21 +1395,17 @@ mod tests {
     Path::new(env!("CARGO_MANIFEST_DIR"))
       .parent()
       .unwrap()
-      .join("node-resolver-core/test/fixture")
+      .parent()
+      .unwrap()
+      .join("packages/utils/node-resolver-core/test/fixture")
   }
 
   fn test_resolver<'a>() -> Resolver<'a> {
-    Resolver::parcel(
-      root().into(),
-      CacheCow::Owned(Cache::new(Arc::new(OsFileSystem))),
-    )
+    Resolver::parcel(&root(), Cache::default())
   }
 
   fn node_resolver<'a>() -> Resolver<'a> {
-    Resolver::node(
-      root().into(),
-      CacheCow::Owned(Cache::new(Arc::new(OsFileSystem))),
-    )
+    Resolver::node(&root(), Cache::default())
   }
 
   #[test]
@@ -1326,7 +1415,7 @@ mod tests {
         .resolve("./bar.js", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -1334,7 +1423,7 @@ mod tests {
         .resolve(".///bar.js", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -1342,7 +1431,7 @@ mod tests {
         .resolve("./bar", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -1350,7 +1439,7 @@ mod tests {
         .resolve("~/bar", &root().join("nested/test.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -1358,7 +1447,7 @@ mod tests {
         .resolve("~bar", &root().join("nested/test.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -1370,7 +1459,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/bar.js"))
     );
     assert_eq!(
@@ -1378,7 +1467,7 @@ mod tests {
         .resolve("./nested", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("nested/index.js"))
     );
     assert_eq!(
@@ -1386,7 +1475,7 @@ mod tests {
         .resolve("./bar?foo=2", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -1408,7 +1497,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("priority/foo.js"))
     );
 
@@ -1441,7 +1530,7 @@ mod tests {
         .resolve("/bar", &root().join("nested/test.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -1453,7 +1542,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
 
@@ -1468,7 +1557,7 @@ mod tests {
           )
           .result
           .unwrap()
-          .0,
+          .resolution,
         Resolution::Path(root().join("bar.js"))
       );
       assert_eq!(
@@ -1480,7 +1569,7 @@ mod tests {
           )
           .result
           .unwrap()
-          .0,
+          .resolution,
         Resolution::Path(root().join("foo.js"))
       );
       assert_eq!(
@@ -1492,7 +1581,7 @@ mod tests {
           )
           .result
           .unwrap()
-          .0,
+          .resolution,
         Resolution::Path(root().join("foo.js"))
       );
     }
@@ -1505,7 +1594,7 @@ mod tests {
         .resolve("foo", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/index.js"))
     );
     assert_eq!(
@@ -1513,7 +1602,7 @@ mod tests {
         .resolve("package-main", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-main/main.js"))
     );
     assert_eq!(
@@ -1521,7 +1610,7 @@ mod tests {
         .resolve("package-module", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-module/module.js"))
     );
     assert_eq!(
@@ -1533,7 +1622,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-browser/browser.js"))
     );
     assert_eq!(
@@ -1545,7 +1634,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-fallback/index.js"))
     );
     assert_eq!(
@@ -1557,7 +1646,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-main-directory/nested/index.js"))
     );
     assert_eq!(
@@ -1565,7 +1654,7 @@ mod tests {
         .resolve("foo/nested/baz", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/nested/baz.js"))
     );
     assert_eq!(
@@ -1573,7 +1662,7 @@ mod tests {
         .resolve("@scope/pkg", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/@scope/pkg/index.js"))
     );
     assert_eq!(
@@ -1585,7 +1674,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/@scope/pkg/foo/bar.js"))
     );
     assert_eq!(
@@ -1597,7 +1686,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/with space.mjs"))
     );
     assert_eq!(
@@ -1609,7 +1698,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/with space.mjs"))
     );
     assert_eq!(
@@ -1621,7 +1710,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/with space.mjs"))
     );
     assert_eq!(
@@ -1648,7 +1737,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/@scope/pkg/index.js"))
     );
     assert_eq!(
@@ -1706,7 +1795,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-browser-alias/browser.js"))
     );
     assert_eq!(
@@ -1718,7 +1807,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-browser-alias/bar.js"))
     );
     assert_eq!(
@@ -1730,7 +1819,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-browser-alias/bar.js"))
     );
     assert_eq!(
@@ -1742,7 +1831,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(
         root().join("node_modules/package-browser-alias/subfolder1/subfolder2/subfile.js")
       )
@@ -1760,7 +1849,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-alias/bar.js"))
     );
     assert_eq!(
@@ -1772,7 +1861,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-alias/bar.js"))
     );
     assert_eq!(
@@ -1784,7 +1873,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-alias-glob/src/test.js"))
     );
     assert_eq!(
@@ -1796,7 +1885,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Empty
     );
     assert_eq!(
@@ -1808,7 +1897,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-alias-glob/src/test.js"))
     );
 
@@ -1853,7 +1942,7 @@ mod tests {
         .resolve("aliased", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/index.js"))
     );
     assert_eq!(
@@ -1865,7 +1954,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/index.js"))
     );
     assert_eq!(
@@ -1877,7 +1966,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/bar.js"))
     );
     assert_eq!(
@@ -1885,7 +1974,7 @@ mod tests {
         .resolve("aliased-file", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -1897,7 +1986,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -1909,7 +1998,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("nested/test.js"))
     );
     assert_eq!(
@@ -1917,7 +2006,7 @@ mod tests {
         .resolve("aliasedfolder", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("nested/index.js"))
     );
     assert_eq!(
@@ -1929,7 +2018,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("nested/test.js"))
     );
     assert_eq!(
@@ -1941,7 +2030,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("nested/index.js"))
     );
     assert_eq!(
@@ -1949,7 +2038,7 @@ mod tests {
         .resolve("foo/bar", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -1957,7 +2046,7 @@ mod tests {
         .resolve("glob/bar/test", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("nested/test.js"))
     );
     assert_eq!(
@@ -1965,7 +2054,7 @@ mod tests {
         .resolve("something", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("nested/test.js"))
     );
     assert_eq!(
@@ -1977,7 +2066,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("nested/test.js"))
     );
     assert_eq!(
@@ -1989,7 +2078,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Empty
     );
     assert_eq!(
@@ -1997,7 +2086,7 @@ mod tests {
         .resolve("./baz", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -2005,7 +2094,7 @@ mod tests {
         .resolve("../baz", &root().join("x/foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -2013,7 +2102,7 @@ mod tests {
         .resolve("~/baz", &root().join("x/foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -2025,7 +2114,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/baz.js"))
     );
     assert_eq!(
@@ -2037,7 +2126,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/baz.js"))
     );
     assert_eq!(
@@ -2049,7 +2138,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -2057,7 +2146,7 @@ mod tests {
         .resolve("url", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Empty
     );
   }
@@ -2073,7 +2162,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::External
     );
     assert_eq!(
@@ -2085,7 +2174,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::External
     );
     assert_eq!(
@@ -2093,7 +2182,7 @@ mod tests {
         .resolve("#hash", &root().join("foo.js"), SpecifierType::Url)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::External
     );
     assert_eq!(
@@ -2114,7 +2203,7 @@ mod tests {
         .resolve("bar.js", &root().join("foo.js"), SpecifierType::Url)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     // Reproduce bug for now
@@ -2133,7 +2222,7 @@ mod tests {
         .resolve("bar", &root().join("foo.js"), SpecifierType::Url)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("bar.js"))
     );
     assert_eq!(
@@ -2141,7 +2230,7 @@ mod tests {
         .resolve("npm:foo", &root().join("foo.js"), SpecifierType::Url)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/index.js"))
     );
     assert_eq!(
@@ -2149,7 +2238,7 @@ mod tests {
         .resolve("npm:@scope/pkg", &root().join("foo.js"), SpecifierType::Url)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/@scope/pkg/index.js"))
     );
   }
@@ -2165,7 +2254,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-exports/main.mjs"))
     );
     assert_eq!(
@@ -2177,7 +2266,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       // "browser" field is NOT used.
       Resolution::Path(root().join("node_modules/package-exports/foo.mjs"))
     );
@@ -2190,7 +2279,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-exports/features/test.mjs"))
     );
     assert_eq!(
@@ -2202,7 +2291,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-exports/features/test.mjs"))
     );
     assert_eq!(
@@ -2214,7 +2303,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-exports/features/test.mjs"))
     );
     assert_eq!(
@@ -2256,7 +2345,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-exports/features/test.mjs"))
     );
     assert_eq!(
@@ -2268,11 +2357,11 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-exports/with space.mjs"))
     );
     // assert_eq!(
-    //   test_resolver().resolve("package-exports/with%20space", &root().join("foo.js"), SpecifierType::Esm).unwrap().0,
+    //   test_resolver().resolve("package-exports/with%20space", &root().join("foo.js"), SpecifierType::Esm).unwrap().resolution,
     //   Resolution::Path(root().join("node_modules/package-exports/with space.mjs"))
     // );
     assert_eq!(
@@ -2348,7 +2437,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-exports/main.mjs"))
     );
     assert_eq!(
@@ -2360,7 +2449,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-exports/foo.mjs"))
     );
   }
@@ -2376,7 +2465,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/package-exports/internal.mjs"))
     );
     assert_eq!(
@@ -2388,7 +2477,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/index.js"))
     );
   }
@@ -2400,7 +2489,7 @@ mod tests {
         .resolve("zlib", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Builtin("zlib".into())
     );
     assert_eq!(
@@ -2408,7 +2497,7 @@ mod tests {
         .resolve("node:zlib", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Builtin("zlib".into())
     );
     assert_eq!(
@@ -2420,7 +2509,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Builtin("fs/promises".into())
     );
   }
@@ -2432,7 +2521,7 @@ mod tests {
         .resolve("ts-path", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("foo.js"))
     );
     assert_eq!(
@@ -2444,7 +2533,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("nested/test.js"))
     );
     assert_eq!(
@@ -2456,7 +2545,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/tsconfig-index/foo.js"))
     );
     assert_eq!(
@@ -2468,7 +2557,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/tsconfig-field/foo.js"))
     );
     assert_eq!(
@@ -2480,7 +2569,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/tsconfig-exports/foo.js"))
     );
     assert_eq!(
@@ -2492,7 +2581,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("tsconfig/extends-extension/foo.js"))
     );
 
@@ -2507,7 +2596,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("tsconfig/extends-node-module/bar.ts"))
     );
 
@@ -2542,7 +2631,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Builtin("zlib".into())
     );
 
@@ -2579,7 +2668,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("tsconfig/suffixes/a.ios.ts"))
     );
     assert_eq!(
@@ -2591,7 +2680,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("tsconfig/suffixes/a.ios.ts"))
     );
     assert_eq!(
@@ -2603,7 +2692,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("tsconfig/suffixes/b.ts"))
     );
     assert_eq!(
@@ -2615,7 +2704,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("tsconfig/suffixes/b.ts"))
     );
     assert_eq!(
@@ -2627,7 +2716,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("tsconfig/suffixes/c-test.ts"))
     );
     assert_eq!(
@@ -2639,7 +2728,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("tsconfig/suffixes/c-test.ts"))
     );
   }
@@ -2655,7 +2744,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("tsconfig/trailing-comma/bar.js"))
     );
   }
@@ -2671,7 +2760,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("ts-extensions/a.ts"))
     );
     assert_eq!(
@@ -2683,7 +2772,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       // TSC always prioritizes .ts over .tsx
       Resolution::Path(root().join("ts-extensions/a.ts"))
     );
@@ -2696,7 +2785,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("ts-extensions/a.mts"))
     );
     assert_eq!(
@@ -2708,7 +2797,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("ts-extensions/a.cts"))
     );
     assert_eq!(
@@ -2720,7 +2809,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       // We deviate from TSC here to match Node/bundlers.
       Resolution::Path(root().join("ts-extensions/b.js"))
     );
@@ -2733,7 +2822,7 @@ mod tests {
         )
         .result
         .unwrap()
-        .0,
+        .resolution,
       // This matches TSC. c.js.ts seems kinda unlikely?
       Resolution::Path(root().join("ts-extensions/c.ts"))
     );
@@ -2795,7 +2884,7 @@ mod tests {
       .resolve(specifier, from, SpecifierType::Esm)
       .result
       .unwrap()
-      .0;
+      .resolution;
 
     if let Resolution::Path(path) = resolved {
       resolver
@@ -2860,7 +2949,7 @@ mod tests {
         .resolve("foo", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::External
     );
     assert_eq!(
@@ -2868,7 +2957,7 @@ mod tests {
         .resolve("@scope/pkg", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::External
     );
 
@@ -2878,7 +2967,7 @@ mod tests {
         .resolve("foo", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/foo/index.js"))
     );
     assert_eq!(
@@ -2886,7 +2975,7 @@ mod tests {
         .resolve("@scope/pkg", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::External
     );
 
@@ -2899,7 +2988,7 @@ mod tests {
         .resolve("foo", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::External
     );
     assert_eq!(
@@ -2907,7 +2996,7 @@ mod tests {
         .resolve("@scope/pkg", &root().join("foo.js"), SpecifierType::Esm)
         .result
         .unwrap()
-        .0,
+        .resolution,
       Resolution::Path(root().join("node_modules/@scope/pkg/index.js"))
     );
   }
