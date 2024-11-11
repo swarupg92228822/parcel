@@ -27,7 +27,8 @@ let {tag} = program
     '--tag <tag>',
     'The npm tag to add to every package published in the latest release',
   )
-  .parse(process.argv);
+  .parse(process.argv)
+  .opts();
 
 if (!tag) {
   throw new Error('Required option `tag` not specified');
