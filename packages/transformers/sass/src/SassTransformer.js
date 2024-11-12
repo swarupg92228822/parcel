@@ -1,6 +1,7 @@
 // @flow
 import {Transformer} from '@parcel/plugin';
 import path from 'path';
+import sass from 'sass';
 import {transformLegacy} from './legacy';
 import {transformModern} from './modern';
 
@@ -71,6 +72,10 @@ export default (new Transformer({
 }): Transformer);
 
 function detectVersion(config: any) {
+  if (!sass.compileStringAsync) {
+    return 'legacy';
+  }
+
   for (let legacyOption of [
     'data',
     'indentType',
