@@ -172,8 +172,8 @@ impl VisitMut for GlobalReplacer<'_> {
       0..0,
       self
         .globals
-        .values()
-        .map(|(_, stmt)| ast::ModuleItem::Stmt(stmt.clone())),
+        .drain(..)
+        .map(|(_, (_, stmt))| ast::ModuleItem::Stmt(stmt)),
     );
   }
 }

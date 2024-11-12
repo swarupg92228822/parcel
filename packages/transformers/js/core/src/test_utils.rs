@@ -87,12 +87,12 @@ fn run_with_transformation<R>(
   );
 
   let mut parser = Parser::new_from(lexer);
-  let module = parser.parse_module().unwrap();
+  let mut module = parser.parse_module().unwrap();
 
   GLOBALS.set(&Globals::new(), || {
     let global_mark = Mark::new();
     let unresolved_mark = Mark::new();
-    let mut module = module.fold_with(&mut resolver(unresolved_mark, global_mark, false));
+    module.visit_mut_with(&mut resolver(unresolved_mark, global_mark, false));
 
     let context = RunTestContext {
       source_map: source_map.clone(),

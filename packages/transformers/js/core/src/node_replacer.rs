@@ -193,8 +193,8 @@ impl<'a> VisitMut for NodeReplacer<'a> {
       0..0,
       self
         .globals
-        .values()
-        .map(|(_, stmt)| ast::ModuleItem::Stmt(stmt.clone())),
+        .drain()
+        .map(|(_, (_, stmt))| ast::ModuleItem::Stmt(stmt)),
     );
   }
 }

@@ -35,7 +35,7 @@ use path_slash::PathExt;
 use serde::{Deserialize, Serialize};
 use swc_core::{
   common::{
-    chain, comments::SingleThreadedComments, errors::Handler, pass::Optional,
+    comments::SingleThreadedComments, errors::Handler, pass::Optional,
     source_map::SourceMapGenConfig, sync::Lrc, FileName, Globals, Mark, SourceMap,
   },
   ecma::{
@@ -45,17 +45,18 @@ use swc_core::{
     preset_env::{preset_env, Mode::Entry, Targets, Version, Versions},
     transforms::{
       base::{
+        assumptions::Assumptions,
         fixer::{fixer, paren_remover},
         helpers,
         hygiene::hygiene,
-        resolver, Assumptions,
+        resolver,
       },
       compat::reserved_words::reserved_words,
       optimization::simplify::{dead_branch_remover, expr_simplifier},
       proposal::decorators,
       react, typescript,
     },
-    visit::{as_folder, FoldWith, VisitWith},
+    visit::{FoldWith, VisitMutWith, VisitWith},
   },
 };
 use typeof_replacer::*;
@@ -231,7 +232,7 @@ pub fn transform(
 
               let global_mark = Mark::fresh(Mark::root());
               let unresolved_mark = Mark::fresh(Mark::root());
-              let module = module.fold_with(&mut chain!(
+              module.mutate(&mut (
                 resolver(unresolved_mark, global_mark, config.is_type_script),
                 // Decorators can use type information, so must run before the TypeScript pass.
                 Optional::new(
@@ -242,7 +243,7 @@ pub fn transform(
                     // use_define_for_class_fields is ignored here, uses preset-env assumptions instead
                     ..Default::default()
                   }),
-                  config.decorators
+                  config.decorators,
                 ),
                 Optional::new(
                   typescript::tsx(
@@ -256,11 +257,11 @@ pub fn transform(
                     unresolved_mark,
                     global_mark,
                   ),
-                  config.is_type_script && config.is_jsx
+                  config.is_type_script && config.is_jsx,
                 ),
                 Optional::new(
                   typescript::strip(unresolved_mark, global_mark),
-                  config.is_type_script && !config.is_jsx
+                  config.is_type_script && !config.is_jsx,
                 ),
               ));
 
@@ -276,7 +277,8 @@ pub fn transform(
                 },
               };
 
-              let mut module = module.fold_with(&mut Optional::new(
+              let mut program = Program::Module(module);
+              program.mutate(&mut Optional::new(
                 react::react(
                   source_map.clone(),
                   Some(&comments),
@@ -286,6 +288,7 @@ pub fn transform(
                 ),
                 config.is_jsx,
               ));
+              let mut module = program.expect_module();
 
               let mut preset_env_config = swc_core::ecma::preset_env::Config {
                 dynamic_import: true,
@@ -326,52 +329,48 @@ pub fn transform(
                 result.is_constant_module = constant_module.is_constant_module;
               }
 
-              let module = {
-                let mut passes = chain!(
-                  Optional::new(
-                    as_folder(TypeofReplacer::new(unresolved_mark)),
-                    config.source_type != SourceType::Script,
-                  ),
-                  // Inline process.env and process.browser,
-                  Optional::new(
-                    as_folder(EnvReplacer {
-                      replace_env: config.replace_env,
-                      env: &config.env,
-                      is_browser: config.is_browser,
-                      used_env: &mut result.used_env,
-                      source_map: source_map.clone(),
-                      diagnostics: &mut diagnostics,
-                      unresolved_mark
-                    }),
-                    config.source_type != SourceType::Script
-                  ),
-                  paren_remover(Some(&comments)),
-                  // Simplify expressions and remove dead branches so that we
-                  // don't include dependencies inside conditionals that are always false.
-                  expr_simplifier(unresolved_mark, Default::default()),
-                  dead_branch_remover(unresolved_mark),
-                  // Inline Node fs.readFileSync calls
-                  Optional::new(
-                    inline_fs(
-                      config.filename.as_str(),
-                      source_map.clone(),
-                      unresolved_mark,
-                      global_mark,
-                      &config.project_root,
-                      &mut fs_deps,
-                      is_module
-                    ),
-                    should_inline_fs
-                  ),
-                );
+              module.visit_mut_with(&mut (
+                Optional::new(
+                  TypeofReplacer::new(unresolved_mark),
+                  config.source_type != SourceType::Script,
+                ),
+                // Inline process.env and process.browser,
+                Optional::new(
+                  EnvReplacer {
+                    replace_env: config.replace_env,
+                    env: &config.env,
+                    is_browser: config.is_browser,
+                    used_env: &mut result.used_env,
+                    source_map: source_map.clone(),
+                    diagnostics: &mut diagnostics,
+                    unresolved_mark,
+                  },
+                  config.source_type != SourceType::Script,
+                ),
+                paren_remover(Some(&comments)),
+                // Simplify expressions and remove dead branches so that we
+                // don't include dependencies inside conditionals that are always false.
+                expr_simplifier(unresolved_mark, Default::default()),
+                dead_branch_remover(unresolved_mark),
+              ));
 
-                module.fold_with(&mut passes)
-              };
+              let mut module = module.fold_with(&mut Optional::new(
+                inline_fs(
+                  config.filename.as_str(),
+                  source_map.clone(),
+                  unresolved_mark,
+                  global_mark,
+                  &config.project_root,
+                  &mut fs_deps,
+                  is_module,
+                ),
+                should_inline_fs,
+              ));
 
-              let module = module.fold_with(
+              module.visit_mut_with(
                 // Replace __dirname and __filename with placeholders in Node env
                 &mut Optional::new(
-                  as_folder(NodeReplacer {
+                  NodeReplacer {
                     source_map: source_map.clone(),
                     items: &mut global_deps,
                     global_mark,
@@ -379,58 +378,55 @@ pub fn transform(
                     filename: Path::new(&config.filename),
                     unresolved_mark,
                     has_node_replacements: &mut result.has_node_replacements,
-                  }),
+                  },
                   config.node_replacer,
                 ),
               );
 
-              let module = {
-                let mut passes = chain!(
-                  // Insert dependencies for node globals
-                  Optional::new(
-                    as_folder(GlobalReplacer {
-                      source_map: source_map.clone(),
-                      items: &mut global_deps,
-                      global_mark,
-                      globals: IndexMap::new(),
-                      project_root: Path::new(&config.project_root),
-                      filename: Path::new(&config.filename),
-                      unresolved_mark,
-                      scope_hoist: config.scope_hoist
-                    }),
-                    config.insert_node_globals
-                  ),
-                  // Transpile new syntax to older syntax if needed
-                  Optional::new(
-                    preset_env(
-                      unresolved_mark,
-                      Some(&comments),
-                      preset_env_config,
-                      assumptions,
-                      &mut Default::default(),
-                    ),
-                    should_run_preset_env,
-                  ),
-                  // Inject SWC helpers if needed.
-                  helpers::inject_helpers(global_mark),
-                );
+              module.visit_mut_with(
+                // Insert dependencies for node globals
+                &mut Optional::new(
+                  GlobalReplacer {
+                    source_map: source_map.clone(),
+                    items: &mut global_deps,
+                    global_mark,
+                    globals: IndexMap::new(),
+                    project_root: Path::new(&config.project_root),
+                    filename: Path::new(&config.filename),
+                    unresolved_mark,
+                    scope_hoist: config.scope_hoist,
+                  },
+                  config.insert_node_globals,
+                ),
+              );
 
-                module.fold_with(&mut passes)
-              };
+              let mut program = Program::Module(module);
+              program.mutate(&mut (
+                // Transpile new syntax to older syntax if needed
+                Optional::new(
+                  preset_env(
+                    unresolved_mark,
+                    Some(&comments),
+                    preset_env_config,
+                    assumptions,
+                    &mut Default::default(),
+                  ),
+                  should_run_preset_env,
+                ),
+                // Inject SWC helpers if needed.
+                helpers::inject_helpers(global_mark),
+              ));
+              let mut module = program.expect_module();
 
               // Flush Id=(JsWord, SyntaxContexts) into unique names and reresolve to
               // set global_mark for all nodes, even generated ones.
               // - This will also remove any other other marks (like ignore_mark)
               // This only needs to be done if preset_env ran because all other transforms
               // insert declarations with global_mark (even though they are generated).
-              let module = if config.scope_hoist && should_run_preset_env {
-                module.fold_with(&mut chain!(
-                  hygiene(),
-                  resolver(unresolved_mark, global_mark, false)
-                ))
-              } else {
+              if config.scope_hoist && should_run_preset_env {
                 module
-              };
+                  .visit_mut_with(&mut (hygiene(), resolver(unresolved_mark, global_mark, false)))
+              }
 
               let ignore_mark = Mark::fresh(Mark::root());
               let module = module.fold_with(
@@ -468,7 +464,7 @@ pub fn transform(
                 diagnostics.extend(bailouts.iter().map(|bailout| bailout.to_diagnostic()));
               }
 
-              let module = if config.scope_hoist {
+              let mut module = if config.scope_hoist {
                 let res = hoist(module, config.module_id.as_str(), unresolved_mark, &collect);
                 match res {
                   Ok((module, hoist_result, hoist_diagnostics)) => {
@@ -492,11 +488,7 @@ pub fn transform(
                 module
               };
 
-              let module = module.fold_with(&mut chain!(
-                reserved_words(),
-                hygiene(),
-                fixer(Some(&comments)),
-              ));
+              module.visit_mut_with(&mut (reserved_words(), hygiene(), fixer(Some(&comments))));
 
               result.dependencies.extend(global_deps);
               result.dependencies.extend(fs_deps);

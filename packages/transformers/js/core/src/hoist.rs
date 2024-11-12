@@ -1354,12 +1354,12 @@ impl<'a> Hoist<'a> {
 #[cfg(test)]
 mod tests {
   use swc_core::{
-    common::{chain, comments::SingleThreadedComments, sync::Lrc, FileName, Globals, SourceMap},
+    common::{comments::SingleThreadedComments, sync::Lrc, FileName, Globals, SourceMap},
     ecma::{
       codegen::text_writer::JsWriter,
       parser::{lexer::Lexer, Parser, StringInput},
       transforms::base::{fixer::fixer, hygiene::hygiene, resolver},
-      visit::VisitWith,
+      visit::{VisitMutWith, VisitWith},
     },
   };
 
@@ -1382,11 +1382,15 @@ mod tests {
 
     let mut parser = Parser::new_from(lexer);
     match parser.parse_program() {
-      Ok(program) => swc_core::common::GLOBALS.set(&Globals::new(), || {
+      Ok(mut program) => swc_core::common::GLOBALS.set(&Globals::new(), || {
         swc_core::ecma::transforms::base::helpers::HELPERS.set(
           &swc_core::ecma::transforms::base::helpers::Helpers::new(false),
           || {
             let is_module = program.is_module();
+            let unresolved_mark = Mark::fresh(Mark::root());
+            let global_mark = Mark::fresh(Mark::root());
+            program.mutate(&mut resolver(unresolved_mark, global_mark, false));
+
             let module = match program {
               Program::Module(module) => module,
               Program::Script(script) => Module {
@@ -1395,10 +1399,6 @@ mod tests {
                 body: script.body.into_iter().map(ModuleItem::Stmt).collect(),
               },
             };
-
-            let unresolved_mark = Mark::fresh(Mark::root());
-            let global_mark = Mark::fresh(Mark::root());
-            let module = module.fold_with(&mut resolver(unresolved_mark, global_mark, false));
 
             let mut collect = Collect::new(
               source_map.clone(),
@@ -1410,13 +1410,13 @@ mod tests {
             );
             module.visit_with(&mut collect);
 
-            let (module, res) = {
+            let (mut module, res) = {
               let mut hoist = Hoist::new("abc", unresolved_mark, &collect);
               let module = module.fold_with(&mut hoist);
               (module, hoist.get_result())
             };
 
-            let module = module.fold_with(&mut chain!(hygiene(), fixer(Some(&comments))));
+            module.visit_mut_with(&mut (hygiene(), fixer(Some(&comments))));
 
             let code = emit(source_map, comments, &module);
             (collect, code, res)
