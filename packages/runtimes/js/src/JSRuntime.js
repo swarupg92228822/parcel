@@ -94,7 +94,7 @@ export default (new Runtime({
           // The linker handles this for scope-hoisting.
           assets.push({
             filePath: __filename,
-            code: `module.exports = Promise.resolve(module.bundle.root(${JSON.stringify(
+            code: `module.exports = Promise.resolve(parcelRequire(${JSON.stringify(
               bundleGraph.getAssetPublicId(resolved.value),
             )}))`,
             dependency,
@@ -422,10 +422,7 @@ function getLoaderRuntime({
   }
 
   if (mainBundle.type === 'js') {
-    let parcelRequire = bundle.env.shouldScopeHoist
-      ? 'parcelRequire'
-      : 'module.bundle.root';
-    loaderCode += `.then(() => ${parcelRequire}('${bundleGraph.getAssetPublicId(
+    loaderCode += `.then(() => parcelRequire('${bundleGraph.getAssetPublicId(
       bundleGraph.getAssetById(bundleGroup.entryAssetId),
     )}'))`;
   }
@@ -552,7 +549,7 @@ function getURLRuntime(
   to: NamedBundle,
   options: PluginOptions,
 ): RuntimeAsset {
-  let relativePathExpr = getRelativePathExpr(from, to, options);
+  let relativePathExpr = getRelativePathExpr(from, to, options, true);
   let code;
 
   if (dependency.meta.webworker === true && !from.env.isLibrary) {
@@ -633,10 +630,11 @@ function getRelativePathExpr(
   from: NamedBundle,
   to: NamedBundle,
   options: PluginOptions,
+  isURL = to.type !== 'js',
 ): string {
   let relativePath = relativeBundlePath(from, to, {leadingDotSlash: false});
   let res = JSON.stringify(relativePath);
-  if (options.hmrOptions) {
+  if (isURL && options.hmrOptions) {
     res += ' + "?" + Date.now()';
   }
 
