@@ -98,7 +98,7 @@ function resolvePathImporter({
       let containingPath = containingUrl
         ? fileURLToPath(containingUrl)
         : asset.filePath;
-      if (!containingUrl) {
+      if (!containingUrl && url.startsWith('file:')) {
         // If containingUrl is not provided, then url should be an absolute file:/// URL.
         let filePath = fileURLToPath(url);
         url = path.relative(path.dirname(containingPath), filePath);
