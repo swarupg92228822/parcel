@@ -527,6 +527,21 @@ module.hot.dispose((data) => {
       assert(!reloaded);
     });
 
+    it('should work when an asset is duplicated', async function () {
+      let {reloaded, outputs} = await testHMRClient(
+        'hmr-duplicate',
+        outputs => {
+          assert.deepEqual(outputs, [7]);
+          return {
+            'shared.js': 'exports.a = 5;',
+          };
+        },
+      );
+
+      assert.deepEqual(outputs, [7, 13]);
+      assert(!reloaded);
+    });
+
     it('should bubble to parents if child returns additional parents', async function () {
       let {reloaded, outputs} = await testHMRClient('hmr-parents', outputs => {
         assert.deepEqual(outputs, ['child 2', 'root']);

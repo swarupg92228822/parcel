@@ -482,7 +482,11 @@ function hmrApply(bundle /*: ParcelRequire */, asset /*:  HMRAsset */) {
       // $FlowFixMe
       let fn = global.parcelHotUpdate[asset.id];
       modules[asset.id] = [fn, deps];
-    } else if (bundle.parent) {
+    }
+
+    // Always traverse to the parent bundle, even if we already replaced the asset in this bundle.
+    // This is required in case modules are duplicated. We need to ensure all instances have the updated code.
+    if (bundle.parent) {
       hmrApply(bundle.parent, asset);
     }
   }
