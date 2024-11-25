@@ -637,7 +637,7 @@ function hmrAccept(bundle /*: ParcelRequire */, id /*: string */) {
       }
     });
 
-    if (assetsToAccept.length) {
+    if (assetsToAlsoAccept.length) {
       let handled = assetsToAlsoAccept.every(function (a) {
         return hmrAcceptCheck(a[0], a[1]);
       });
