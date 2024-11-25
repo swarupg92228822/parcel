@@ -5,6 +5,17 @@ All notable changes to Parcel will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and Parcel adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [2.13.1] - 2024-11-24
+
+### Fixed
+
+- JavaScript
+  - Improve HMR with dynamic imports – [Details](https://github.com/parcel-bundler/parcel/pull/10017)
+  - Update SWC – [Details](https://github.com/parcel-bundler/parcel/commit/15c77cbe7557fb441df5d0fc09dab220f55fa4db)
+
+- SASS
+  - Fix SASS resolution rules for modern API – [Details](https://github.com/parcel-bundler/parcel/pull/10018)
+
 ## [2.13.0] - 2024-11-12
 
 ### Added
