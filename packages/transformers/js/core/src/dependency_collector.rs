@@ -1,16 +1,18 @@
 use std::{
-  collections::{hash_map::DefaultHasher, HashMap},
+  collections::hash_map::DefaultHasher,
   fmt,
   hash::{Hash, Hasher},
   path::Path,
 };
 
+use bitflags::bitflags;
+use parcel_macros::{Evaluator, JsValue};
 use path_slash::PathBufExt;
 use serde::{Deserialize, Serialize};
 use swc_core::{
   common::{sync::Lrc, Mark, SourceMap, Span, SyntaxContext, DUMMY_SP},
   ecma::{
-    ast::{self, Callee, IdentName, MemberProp},
+    ast::{self, Callee, MemberProp, Module},
     atoms::{js_word, JsWord},
     utils::{member_expr, stack_size::maybe_grow_default},
     visit::{Fold, FoldWith},
@@ -97,19 +99,32 @@ pub enum DependencyKind {
   Id,
 }
 
+bitflags! {
+  #[derive(Serialize, Deserialize, Default)]
+  #[serde(transparent)]
+  pub struct Helpers: u8 {
+    /// `import.meta.distDir` – a relative path from the current bundle to the distDir
+    const DIST_DIR = 1 << 0;
+    /// `import.meta.publicUrl` - absolute public URL
+    const PUBLIC_URL = 1 << 1;
+    /// `parcelRequire.load`
+    const LOAD = 1 << 2;
+  }
+}
+
 impl fmt::Display for DependencyKind {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
     write!(f, "{:?}", self)
   }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DependencyDescriptor {
   pub kind: DependencyKind,
   pub loc: SourceLocation,
   /// The text specifier associated with the import/export statement.
   pub specifier: swc_core::ecma::atoms::JsWord,
-  pub attributes: Option<HashMap<swc_core::ecma::atoms::JsWord, bool>>,
+  pub attributes: Option<JsValue>,
   pub is_optional: bool,
   pub is_helper: bool,
   pub source_type: Option<SourceType>,
@@ -118,14 +133,15 @@ pub struct DependencyDescriptor {
 
 /// This pass collects dependencies in a module and compiles references as needed to work with Parcel's JSRuntime.
 pub fn dependency_collector<'a>(
+  module: Module,
   source_map: Lrc<SourceMap>,
   items: &'a mut Vec<DependencyDescriptor>,
   ignore_mark: swc_core::common::Mark,
   unresolved_mark: swc_core::common::Mark,
   config: &'a Config,
   diagnostics: &'a mut Vec<Diagnostic>,
-) -> impl Fold + 'a {
-  DependencyCollector {
+) -> (Module, Helpers) {
+  let mut collector = DependencyCollector {
     source_map,
     items,
     in_try: false,
@@ -136,7 +152,11 @@ pub fn dependency_collector<'a>(
     config,
     diagnostics,
     import_meta: None,
-  }
+    helpers: Helpers::empty(),
+  };
+
+  let module = module.fold_with(&mut collector);
+  (module, collector.helpers)
 }
 
 struct DependencyCollector<'a> {
@@ -150,6 +170,7 @@ struct DependencyCollector<'a> {
   config: &'a Config,
   diagnostics: &'a mut Vec<Diagnostic>,
   import_meta: Option<ast::VarDecl>,
+  helpers: Helpers,
 }
 
 impl<'a> DependencyCollector<'a> {
@@ -158,7 +179,7 @@ impl<'a> DependencyCollector<'a> {
     mut specifier: JsWord,
     span: swc_core::common::Span,
     kind: DependencyKind,
-    attributes: Option<HashMap<swc_core::ecma::atoms::JsWord, bool>>,
+    attributes: Option<JsValue>,
     is_optional: bool,
     source_type: SourceType,
   ) -> Option<JsWord> {
@@ -344,11 +365,17 @@ impl<'a> Fold for DependencyCollector<'a> {
       return node;
     }
 
+    let evaluator = Evaluator::new(&self.source_map);
+    let attributes = node
+      .with
+      .as_ref()
+      .and_then(|attrs| evaluator.eval_object(&*attrs).ok());
+
     let rewritten = self.add_dependency(
       node.src.value.clone(),
       node.src.span,
       DependencyKind::Import,
-      None,
+      attributes,
       false,
       self.config.source_type,
     );
@@ -366,11 +393,17 @@ impl<'a> Fold for DependencyCollector<'a> {
         return node;
       }
 
+      let evaluator = Evaluator::new(&self.source_map);
+      let attributes = node
+        .with
+        .as_ref()
+        .and_then(|attrs| evaluator.eval_object(&*attrs).ok());
+
       let rewritten = self.add_dependency(
         src.value.clone(),
         src.span,
         DependencyKind::Export,
-        None,
+        attributes,
         false,
         self.config.source_type,
       );
@@ -384,11 +417,17 @@ impl<'a> Fold for DependencyCollector<'a> {
   }
 
   fn fold_export_all(&mut self, mut node: ast::ExportAll) -> ast::ExportAll {
+    let evaluator = Evaluator::new(&self.source_map);
+    let attributes = node
+      .with
+      .as_ref()
+      .and_then(|attrs| evaluator.eval_object(&*attrs).ok());
+
     let rewritten = self.add_dependency(
       node.src.value.clone(),
       node.src.span,
       DependencyKind::Export,
-      None,
+      attributes,
       false,
       self.config.source_type,
     );
@@ -439,7 +478,7 @@ impl<'a> Fold for DependencyCollector<'a> {
                 }
               }
               "importScripts" => {
-                if self.config.is_worker {
+                if self.config.is_worker() {
                   let (msg, span) = if self.config.source_type == SourceType::Script {
                     // Ignore if argument is not a string literal.
                     let span = if let Some(ast::ExprOrSpread { expr, .. }) = node.args.first() {
@@ -547,9 +586,23 @@ impl<'a> Fold for DependencyCollector<'a> {
             }
           }
           Member(member) => {
-            if match_member_expr(member, vec!["module", "require"], self.unresolved_mark) {
+            if match_member_expr(member, vec!["parcelRequire", "load"], self.unresolved_mark) {
+              let mut call = node.fold_children_with(self);
+              let callee = if self.config.scope_hoist {
+                ast::Expr::Ident(ast::Ident::new_no_ctxt("$parcel$import".into(), call.span))
+              } else {
+                ast::Expr::Member(member_expr!(
+                  Default::default(),
+                  call.span,
+                  module.bundle.load
+                ))
+              };
+              call.callee = ast::Callee::Expr(Box::new(callee));
+              self.helpers |= Helpers::DIST_DIR | Helpers::LOAD;
+              return call;
+            } else if match_member_expr(member, vec!["module", "require"], self.unresolved_mark) {
               DependencyKind::Require
-            } else if self.config.is_browser
+            } else if self.config.is_browser()
               && match_member_expr(
                 member,
                 vec!["navigator", "serviceWorker", "register"],
@@ -557,7 +610,7 @@ impl<'a> Fold for DependencyCollector<'a> {
               )
             {
               DependencyKind::ServiceWorker
-            } else if self.config.is_browser
+            } else if self.config.is_browser()
               && match_member_expr(
                 member,
                 vec!["CSS", "paintWorklet", "addModule"],
@@ -637,38 +690,14 @@ impl<'a> Fold for DependencyCollector<'a> {
     let mut attributes = None;
     if kind == DependencyKind::DynamicImport {
       if let Some(arg) = node.args.get(1) {
-        if let Object(arg) = &*arg.expr {
-          let mut attrs = HashMap::new();
-          for key in &arg.props {
-            let prop = match key {
-              ast::PropOrSpread::Prop(prop) => prop,
-              _ => continue,
-            };
-
-            let kv = match &**prop {
-              ast::Prop::KeyValue(kv) => kv,
-              _ => continue,
-            };
-
-            let k = match &kv.key {
-              ast::PropName::Ident(IdentName { sym, .. })
-              | ast::PropName::Str(ast::Str { value: sym, .. }) => sym.clone(),
-              _ => continue,
-            };
-
-            let v = match &*kv.value {
-              Lit(ast::Lit::Bool(ast::Bool { value, .. })) => *value,
-              _ => continue,
-            };
-
-            attrs.insert(k, v);
-          }
-
-          attributes = Some(attrs);
+        if let Object(_) = &*arg.expr {
+          let evaluator = Evaluator::new(&self.source_map);
+          attributes = evaluator.eval(&*arg.expr).ok();
         }
       }
     }
 
+    let mut is_specifier_str = false;
     let node = if let Some(arg) = node.args.first() {
       if kind == DependencyKind::ServiceWorker || kind == DependencyKind::Worklet {
         let (source_type, opts) = if kind == DependencyKind::ServiceWorker {
@@ -726,6 +755,7 @@ impl<'a> Fold for DependencyCollector<'a> {
       }
 
       if let Some((specifier, span)) = match_str(&arg.expr) {
+        is_specifier_str = true;
         // require() calls aren't allowed in scripts, flag as an error.
         if kind == DependencyKind::Require && self.config.source_type == SourceType::Script {
           self.add_script_error(node.span);
@@ -761,8 +791,8 @@ impl<'a> Fold for DependencyCollector<'a> {
 
     // Replace import() with require()
     if kind == DependencyKind::DynamicImport {
-      let mut call = node;
-      if !self.config.scope_hoist && !self.config.standalone {
+      let mut call = node.fold_children_with(self);
+      if !self.config.scope_hoist && !self.config.standalone && is_specifier_str {
         let name = match &self.config.source_type {
           SourceType::Module => "require",
           SourceType::Script => "__parcel__require__",
@@ -813,7 +843,7 @@ impl<'a> Fold for DependencyCollector<'a> {
       Ident(id) => {
         if id.sym == "Worker" || id.sym == "SharedWorker" {
           // Bail if defined in scope
-          self.config.is_browser && is_unresolved(&id, self.unresolved_mark)
+          self.config.is_browser() && is_unresolved(&id, self.unresolved_mark)
         } else if id.sym == "Promise" {
           // Match requires inside promises (e.g. Rollup compiled dynamic imports)
           // new Promise(resolve => resolve(require('foo')))
@@ -918,6 +948,10 @@ impl<'a> Fold for DependencyCollector<'a> {
 
     if self.is_import_meta_url(&node) {
       return self.get_import_meta_url();
+    }
+
+    if let Some(expr) = self.match_import_meta_prop(&node) {
+      return expr;
     }
 
     if let Some((specifier, span)) = self.match_new_url(&node) {
@@ -1343,7 +1377,63 @@ impl<'a> DependencyCollector<'a> {
         }
         true
       }
+      Expr::Member(member) => {
+        match_member_expr(member, vec!["parcelRequire", "meta"], self.unresolved_mark)
+      }
       _ => false,
+    }
+  }
+
+  fn match_import_meta_prop(&mut self, expr: &ast::Expr) -> Option<ast::Expr> {
+    use ast::*;
+
+    match expr {
+      Expr::Member(member) => {
+        if !self.is_import_meta(&member.obj) {
+          return None;
+        }
+
+        let name = match_property_name(member);
+
+        if let Some((name, span)) = name {
+          match name.as_str() {
+            "distDir" => {
+              self.helpers |= Helpers::DIST_DIR;
+              if self.config.scope_hoist {
+                Some(Expr::Ident(Ident::new_no_ctxt(
+                  "$parcel$distDir".into(),
+                  span,
+                )))
+              } else {
+                Some(Expr::Member(member_expr!(
+                  Default::default(),
+                  span,
+                  module.bundle.distDir
+                )))
+              }
+            }
+            "publicUrl" => {
+              self.helpers |= Helpers::PUBLIC_URL;
+              if self.config.scope_hoist {
+                Some(Expr::Ident(Ident::new_no_ctxt(
+                  "$parcel$publicUrl".into(),
+                  span,
+                )))
+              } else {
+                Some(Expr::Member(member_expr!(
+                  Default::default(),
+                  span,
+                  module.bundle.publicUrl
+                )))
+              }
+            }
+            _ => None,
+          }
+        } else {
+          None
+        }
+      }
+      _ => None,
     }
   }
 
@@ -1532,13 +1622,12 @@ mod test {
       config,
       diagnostics,
       import_meta: None,
+      helpers: Helpers::empty(),
     }
   }
 
   fn make_config() -> Config {
-    let mut config = Config::default();
-    config.is_browser = true;
-    config
+    Config::default()
   }
 
   fn make_placeholder_hash(specifier: &str, dependency_kind: DependencyKind) -> String {

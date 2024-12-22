@@ -11,7 +11,7 @@ import type {
 } from '@parcel/types';
 
 import {Runtime} from '@parcel/plugin';
-import {relativeBundlePath} from '@parcel/utils';
+import {relativeBundlePath, urlJoin} from '@parcel/utils';
 import path from 'path';
 import nullthrows from 'nullthrows';
 
@@ -188,13 +188,22 @@ export default (new Runtime({
       }
 
       // URL dependency or not, fall back to including a runtime that exports the url
-      assets.push(getURLRuntime(dependency, bundle, mainBundle, options));
+      let mainAsset = mainBundle
+        .getEntryAssets()
+        .find(e => e.id === bundleGroup.entryAssetId);
+      if (
+        dependency.specifierType === 'url' ||
+        mainBundle.type !== 'js' ||
+        mainAsset?.meta.jsRuntime === 'url'
+      ) {
+        assets.push(getURLRuntime(dependency, bundle, mainBundle, options));
+      }
     }
 
     // In development, bundles can be created lazily. This means that the parent bundle may not
     // know about all of the sibling bundles of a child when it is written for the first time.
     // Therefore, we need to also ensure that the siblings are loaded when the child loads.
-    if (options.shouldBuildLazily && bundle.env.outputFormat === 'global') {
+    if (options.shouldBuildLazily && !bundle.env.shouldScopeHoist) {
       let referenced = bundleGraph.getReferencedBundles(bundle);
       for (let referencedBundle of referenced) {
         let loaders = getLoaders(bundle.env);
@@ -370,10 +379,7 @@ function getLoaderRuntime({
 
     // In development, clear the require cache when an error occurs so the
     // user can try again (e.g. after fixing a build error).
-    if (
-      options.mode === 'development' &&
-      bundle.env.outputFormat === 'global'
-    ) {
+    if (options.mode === 'development' && !bundle.env.shouldScopeHoist) {
       code +=
         '.catch(err => {delete module.bundle.cache[module.id]; throw err;})';
     }
@@ -569,6 +575,10 @@ function getURLRuntime(
         from.env.outputFormat === 'esmodule',
       )});`;
     }
+  } else if (from.env.isServer() && to.env.isBrowser()) {
+    code = `module.exports = ${JSON.stringify(
+      urlJoin(to.target.publicUrl, to.name),
+    )};`;
   } else {
     code = `module.exports = ${getAbsoluteUrlExpr(relativePathExpr, from)};`;
   }
