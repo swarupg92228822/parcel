@@ -1,5 +1,5 @@
 {
-  "name": "@parcel/runtime-rsc",
+  "name": "@parcel/namer-static",
   "version": "2.13.3",
   "license": "MIT",
   "publishConfig": {
@@ -13,23 +13,15 @@
     "type": "git",
     "url": "https://github.com/parcel-bundler/parcel.git"
   },
-  "main": "lib/RSCRuntime.js",
-  "exports": {
-    ".": {
-      "react-server": "./resources.js",
-      "source": "./src/RSCRuntime.js",
-      "default": "./lib/RSCRuntime.js"
-    },
-    "./resources": "./resources.js"
-  },
+  "main": "lib/StaticNamer.js",
+  "source": "src/StaticNamer.js",
   "engines": {
-    "node": ">= 12.0.0",
-    "parcel": "^2.8.3"
+    "node": ">= 16.0.0",
+    "parcel": "^2.13.3"
   },
   "dependencies": {
+    "@parcel/diagnostic": "2.13.3",
     "@parcel/plugin": "2.13.3",
-    "@parcel/rust": "2.13.3",
-    "@parcel/utils": "2.13.3",
     "nullthrows": "^1.1.1"
   }
 }
