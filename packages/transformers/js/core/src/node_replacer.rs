@@ -12,7 +12,7 @@ use swc_core::{
 };
 
 use crate::{
-  dependency_collector::{DependencyDescriptor, DependencyKind},
+  dependency_collector::{DependencyDescriptor, DependencyFlags, DependencyKind},
   utils::{create_global_decl_stmt, create_require, is_unresolved, SourceLocation, SourceType},
 };
 
@@ -103,8 +103,7 @@ impl<'a> VisitMut for NodeReplacer<'a> {
                 loc: SourceLocation::from(&self.source_map, id.span),
                 specifier: path_module_specifier,
                 attributes: None,
-                is_optional: false,
-                is_helper: false,
+                flags: DependencyFlags::empty(),
                 source_type: Some(SourceType::Module),
                 placeholder: None,
               });
@@ -152,8 +151,7 @@ impl<'a> VisitMut for NodeReplacer<'a> {
                 loc: SourceLocation::from(&self.source_map, id.span),
                 specifier: path_module_specifier,
                 attributes: None,
-                is_optional: false,
-                is_helper: false,
+                flags: DependencyFlags::empty(),
                 source_type: Some(SourceType::Module),
                 placeholder: None,
               });
