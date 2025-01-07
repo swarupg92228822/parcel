@@ -2,7 +2,7 @@
 
 import {Runtime} from '@parcel/plugin';
 import nullthrows from 'nullthrows';
-import {urlJoin, normalizeSeparators} from '@parcel/utils';
+import {urlJoin, normalizeSeparators, relativeBundlePath} from '@parcel/utils';
 import path from 'path';
 import {hashString} from '@parcel/rust';
 
@@ -44,32 +44,57 @@ export default (new Runtime({
           Array.isArray(directives) &&
           directives.includes('use client')
         ) {
-          let browserBundles;
+          let bundles;
           let async = bundleGraph.resolveAsyncDependency(node.value, bundle);
           if (async?.type === 'bundle_group') {
-            browserBundles = bundleGraph
-              .getBundlesInBundleGroup(async.value)
-              .filter(b => b.type === 'js' && b.env.isBrowser())
-              .map(b => normalizeSeparators(b.name));
+            bundles = bundleGraph.getBundlesInBundleGroup(async.value);
           } else {
-            browserBundles = bundleGraph
-              .getReferencedBundles(bundle)
-              .filter(b => b.type === 'js' && b.env.isBrowser())
-              .map(b => normalizeSeparators(b.name));
+            bundles = bundleGraph.getReferencedBundles(bundle);
           }
 
+          let jsBundles = bundles
+            .filter(b => b.type === 'js' && b.env.isBrowser())
+            .map(b => normalizeSeparators(b.name));
+
           let code = `import {createClientReference} from "react-server-dom-parcel/server.edge";\n`;
+          let resources = [];
+          if (node.value.priority === 'lazy') {
+            // If this is an async boundary, inject CSS.
+            // JS for client components in injected by prepareDestinationForModule in React.
+            for (let b of bundles) {
+              if (b.type === 'css') {
+                resources.push(renderStylesheet(b));
+              }
+            }
+
+            if (resources.length) {
+              code += `let resources = ${
+                resources.length > 1
+                  ? '<>' + resources.join('\n') + '</>'
+                  : resources[0]
+              };\n`;
+              code += `let resourcesSymbol = Symbol.for('react.resources');\n`;
+            }
+          }
+
+          let count = 0;
           for (let symbol of bundleGraph.getExportedSymbols(
             resolvedAsset,
             bundle,
           )) {
-            code += `exports[${JSON.stringify(
-              symbol.exportAs,
-            )}] = createClientReference(${JSON.stringify(
+            let ref = `createClientReference(${JSON.stringify(
               bundleGraph.getAssetPublicId(symbol.asset),
             )}, ${JSON.stringify(symbol.exportSymbol)}, ${JSON.stringify(
-              browserBundles,
-            )});\n`;
+              jsBundles,
+            )})`;
+            if (resources.length) {
+              code += `var Ref${++count} = ${ref};\n`;
+              code += `exports[${JSON.stringify(
+                symbol.exportAs,
+              )}] = (props) => <>{resources}<Ref${count} {...props} /></>;\n`;
+            } else {
+              code += `exports[${JSON.stringify(symbol.exportAs)}] = ${ref};\n`;
+            }
           }
 
           code += `exports.__esModule = true;\n`;
@@ -162,62 +187,144 @@ export default (new Runtime({
             dependency: node.value,
             env: {sourceType: 'module'},
           });
+        } else {
+          // Handle bundle group boundaries to automatically inject resources like CSS.
+          // This is normally handled by the JS runtime, but we need to add resources to the
+          // React tree so they get loaded during SSR as well.
+          let asyncResolution = bundleGraph.resolveAsyncDependency(node.value);
+          if (asyncResolution?.type === 'bundle_group') {
+            let bundles = bundleGraph.getBundlesInBundleGroup(
+              asyncResolution.value,
+            );
+            let resources = [];
+            let js = [];
+            let preinit = [];
+            let css = [];
+            let bootstrapModules = [];
+            let entry;
+            for (let b of bundles) {
+              if (b.type === 'css') {
+                resources.push(renderStylesheet(b));
+                if (bundle.env.isBrowser()) {
+                  let url = urlJoin(b.target.publicUrl, b.name);
+                  preinit.push(
+                    `preinit(${JSON.stringify(
+                      url,
+                    )}, {as: 'style', precedence: 'default'});`,
+                  );
+                  css.push(`waitForCSS(${JSON.stringify(url)})`);
+                }
+              } else if (b.type === 'js') {
+                if (b.env.isBrowser()) {
+                  let url = urlJoin(b.target.publicUrl, b.name);
+                  // Preload scripts for dynamic imports during SSR.
+                  // TODO: is this safe? may not have prelude yet
+                  resources.push(
+                    `<script type="module" async src=${JSON.stringify(url)} />`,
+                  );
+                  bootstrapModules.push(url);
+                }
 
-          // Dependency on a Resources component.
-        } else if (
-          node.value.specifier === '@parcel/runtime-rsc' ||
-          node.value.specifier === '@parcel/runtime-rsc/resources'
-        ) {
-          // Generate a component that renders link tags for stylesheets referenced by the bundle.
-          let bundles = bundleGraph.getReferencedBundles(bundle);
-          let code =
-            'import React from "react";\nexport function Resources() {\n  return <>\n';
-          let entry;
-          let imports = '';
-          for (let b of bundles) {
-            if (!b.env.isBrowser()) {
-              continue;
-            }
-            let url = urlJoin(b.target.publicUrl, b.name);
-            if (b.type === 'css') {
-              code += `<link rel="stylesheet" href=${JSON.stringify(
-                url,
-              )} precedence="default" />\n`;
-            } else if (b.type === 'js') {
-              imports += `import ${JSON.stringify(url)};`;
-            }
-            b.traverseAssets((a, ctx, actions) => {
-              if (
-                Array.isArray(a.meta.directives) &&
-                a.meta.directives.includes('use client-entry')
-              ) {
-                entry = a;
-                actions.stop();
+                if (b.env.context === bundle.env.context) {
+                  if (b.env.outputFormat === 'esmodule') {
+                    js.push(`parcelRequire.load(${JSON.stringify(b.name)})`);
+                  } else if (b.env.outputFormat === 'commonjs') {
+                    let relativePath = JSON.stringify(
+                      relativeBundlePath(bundle, b),
+                    );
+                    js.push(
+                      `Promise.resolve(__parcel__require__(${relativePath}))`,
+                    );
+                  } else {
+                    throw new Error(
+                      'Unsupported output format: ' + b.env.outputFormat,
+                    );
+                  }
+                }
+
+                // Find the client entry in this bundle group if any.
+                if (bundle.env.isServer() && b.env.isBrowser() && !entry) {
+                  b.traverseAssets((a, ctx, actions) => {
+                    if (
+                      Array.isArray(a.meta.directives) &&
+                      a.meta.directives.includes('use client-entry')
+                    ) {
+                      entry = a;
+                      actions.stop();
+                    }
+                  });
+                }
               }
-            });
+            }
+
+            if (resources) {
+              // Use a proxy to attach resources to all exports.
+              // This will be used by the JSX runtime to automatically render CSS at bundle group boundaries.
+              let code = `import {createResourcesProxy, waitForCSS} from '@parcel/runtime-rsc/rsc-helpers';\n`;
+              if (node.value.priority === 'lazy') {
+                if (preinit.length) {
+                  // Start preloading CSS via React.
+                  code += `import {preinit} from 'react-dom';\n`;
+                  code += preinit.join('\n') + '\n';
+                }
+                code += `let promise = Promise.all([${js.join(
+                  ', ',
+                )}]).then(() => {\n`;
+                // If promise is not being loaded by React.lazy, wait for CSS to load.
+                // Otherwise, React will suspend on the rendered <link> element in the resources.
+                // This allows React to start rendering earlier if the CSS takes longer to load.
+                if (css.length && node.value.meta.isReactLazy !== true) {
+                  code += `  return Promise.all([${css.join(', ')}]);\n`;
+                  code += '}).then(() => {\n';
+                }
+              }
+
+              // Also attach a bootstrap script which will be injected into the initial HTML.
+              if (node.value.priority !== 'lazy' && entry) {
+                let bootstrapScript = `Promise.all([${bootstrapModules
+                  .map(m => `import("${m}")`)
+                  .join(',')}]).then(()=>${
+                  nullthrows(config).parcelRequireName
+                }(${JSON.stringify(bundleGraph.getAssetPublicId(entry))}))`;
+                code += `let bootstrapScript = ${JSON.stringify(
+                  bootstrapScript,
+                )};\n`;
+              }
+
+              let resolvedAsset = bundleGraph.getAssetById(
+                asyncResolution.value.entryAssetId,
+              );
+              code += `let originalModule = parcelRequire(${JSON.stringify(
+                bundleGraph.getAssetPublicId(resolvedAsset),
+              )});\n`;
+              code += `let resources = ${
+                resources.length > 1
+                  ? '<>\n  ' + resources.join('\n  ') + '\n</>'
+                  : resources[0]
+              };\n`;
+              code += `let res = createResourcesProxy(originalModule, resources ${
+                node.value.priority !== 'lazy' && entry
+                  ? ', bootstrapScript'
+                  : ''
+              });\n`;
+
+              if (node.value.priority === 'lazy') {
+                code += `  return res;\n`;
+                code += `});\n`;
+                code += `module.exports = promise;\n`;
+              } else {
+                code += `module.exports = res;\n`;
+              }
+
+              let filePath = nullthrows(node.value.sourcePath);
+              runtimes.push({
+                filePath: replaceExtension(filePath),
+                code,
+                dependency: node.value,
+                env: {sourceType: 'module'},
+              });
+            }
           }
-
-          // React will insert async script tags for client components to preinit them asap.
-          // Add an inline script element to bootstrap the page, by calling parcelRequire for the client-entry module.
-          // We use import statements to wait for the dependent bundles to load.
-          if (entry) {
-            code += `<script type="module">${imports}${
-              nullthrows(config).parcelRequireName
-            }(${JSON.stringify(
-              bundleGraph.getAssetPublicId(entry),
-            )})</script>\n`;
-          }
-
-          code += '</>;\n}\n';
-
-          let filePath = nullthrows(node.value.sourcePath);
-          runtimes.push({
-            filePath: replaceExtension(filePath),
-            code,
-            dependency: node.value,
-            env: {sourceType: 'module'},
-            shouldReplaceResolution: true,
-          });
         }
       }
     });
@@ -262,7 +369,7 @@ export default (new Runtime({
 
       // React needs AsyncLocalStorage defined as a global for the edge environment.
       // Without this, preinit scripts won't be inserted during SSR.
-      code += 'if (typeof AsyncLocalHooks === "undefined") {\n';
+      code += 'if (typeof AsyncLocalStorage === "undefined") {\n';
       code += '  try {\n';
       code +=
         '    globalThis.AsyncLocalStorage = require("node:async_hooks").AsyncLocalStorage;\n';
@@ -286,4 +393,11 @@ export default (new Runtime({
 function replaceExtension(filePath, extension = '.jsx') {
   let ext = path.extname(filePath);
   return filePath.slice(0, -ext.length) + extension;
+}
+
+function renderStylesheet(b) {
+  let url = urlJoin(b.target.publicUrl, b.name);
+  return `<link rel="stylesheet" href=${JSON.stringify(
+    url,
+  )} precedence="default" />`;
 }
