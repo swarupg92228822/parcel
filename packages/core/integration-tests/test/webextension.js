@@ -1,6 +1,6 @@
 import assert from 'assert';
 import path from 'path';
-import {bundle, assertBundles, outputFS, distDir} from '@parcel/test-utils';
+import {assertBundles, bundle, distDir, outputFS} from '@parcel/test-utils';
 
 describe('webextension', function () {
   it('should resolve a full webextension bundle', async function () {
@@ -35,6 +35,9 @@ describe('webextension', function () {
       {assets: ['devtools.html']},
       {assets: ['content.js']},
       {assets: ['content.css']},
+      {
+        assets: ['ruleset_1.json'],
+      },
     ]);
     assert(
       await outputFS.exists(
@@ -49,6 +52,10 @@ describe('webextension', function () {
     );
     const scripts = manifest.background.scripts;
     assert.equal(scripts.length, 1);
+    for (const {path: resourcePath} of manifest.declarative_net_request
+      ?.rule_resources ?? []) {
+      assert(await outputFS.exists(path.join(distDir, resourcePath)));
+    }
     assert(
       (
         await outputFS.readFile(path.join(distDir, scripts[0]), 'utf-8')
@@ -79,7 +86,6 @@ describe('webextension', function () {
           'esmodule-helpers.js',
           'index-jsx.jsx',
           'index.js',
-          'index.js',
           'react.development.js',
         ],
       },
@@ -104,9 +110,11 @@ describe('webextension', function () {
         assets: ['manifest.json'],
       },
       {assets: ['background.js']},
+      {assets: ['background.js']},
       {assets: ['popup.html']},
       {assets: ['popup.css']},
-      {assets: ['popup.js', 'esmodule-helpers.js', 'bundle-url.js']},
+      {assets: ['popup.js', 'esmodule-helpers.js']},
+      {assets: ['side-panel.html']},
       {assets: ['content-script.js']},
       {assets: ['other-content-script.js']},
       {assets: ['injected.css']},

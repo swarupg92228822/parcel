@@ -1,15 +1,21 @@
 // @flow strict-local
 import type {FilePath} from '@parcel/types';
 import type {Cache} from './types';
+import type {Readable, Writable} from 'stream';
 
-import {Readable} from 'stream';
+import stream from 'stream';
 import path from 'path';
+import {promisify} from 'util';
 import {serialize, deserialize, registerSerializableClass} from '@parcel/core';
 import {NodeFS} from '@parcel/fs';
 // flowlint-next-line untyped-import:off
 import packageJson from '../package.json';
 // $FlowFixMe
 import lmdb from 'lmdb';
+
+const pipeline: (Readable, Writable) => Promise<void> = promisify(
+  stream.pipeline,
+);
 
 export class LMDBCache implements Cache {
   fs: NodeFS;
@@ -64,12 +70,10 @@ export class LMDBCache implements Cache {
   }
 
   setStream(key: string, stream: Readable): Promise<void> {
-    return new Promise((resolve, reject) => {
-      stream
-        .pipe(this.fs.createWriteStream(path.join(this.dir, key)))
-        .on('error', reject)
-        .on('finish', resolve);
-    });
+    return pipeline(
+      stream,
+      this.fs.createWriteStream(path.join(this.dir, key)),
+    );
   }
 
   getBlob(key: string): Promise<Buffer> {
@@ -91,12 +95,32 @@ export class LMDBCache implements Cache {
     return this.fs.exists(path.join(this.dir, key));
   }
 
-  getLargeBlob(key: string): Promise<Buffer> {
+  // eslint-disable-next-line require-await
+  async getLargeBlob(key: string): Promise<Buffer> {
     return this.fs.readFile(path.join(this.dir, key));
   }
 
-  async setLargeBlob(key: string, contents: Buffer | string): Promise<void> {
-    await this.fs.writeFile(path.join(this.dir, key), contents);
+  // eslint-disable-next-line require-await
+  async setLargeBlob(
+    key: string,
+    contents: Buffer | string,
+    options?: {|signal?: AbortSignal|},
+  ): Promise<void> {
+    await this.fs.writeFile(path.join(this.dir, key), contents, {
+      signal: options?.signal,
+    });
+  }
+
+  async deleteLargeBlob(key: string): Promise<void> {
+    await this.fs.rimraf(path.join(this.dir, key));
+  }
+
+  refresh(): void {
+    // Reset the read transaction for the store. This guarantees that
+    // the next read will see the latest changes to the store.
+    // Useful in scenarios where reads and writes are multi-threaded.
+    // See https://github.com/kriszyp/lmdb-js#resetreadtxn-void
+    this.store.resetReadTxn();
   }
 }
 

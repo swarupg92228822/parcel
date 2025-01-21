@@ -1,6 +1,6 @@
 {
   "name": "@parcel/transformer-svg",
-  "version": "2.6.0",
+  "version": "2.13.3",
   "license": "MIT",
   "publishConfig": {
     "access": "public"
@@ -16,17 +16,17 @@
   "main": "lib/SVGTransformer.js",
   "source": "src/SVGTransformer.js",
   "engines": {
-    "node": ">= 12.0.0",
-    "parcel": "^2.6.0"
+    "node": ">= 16.0.0",
+    "parcel": "^2.13.3"
   },
   "dependencies": {
-    "@parcel/diagnostic": "2.6.0",
-    "@parcel/hash": "2.6.0",
-    "@parcel/plugin": "2.6.0",
+    "@parcel/diagnostic": "2.13.3",
+    "@parcel/plugin": "2.13.3",
+    "@parcel/rust": "2.13.3",
     "nullthrows": "^1.1.1",
     "posthtml": "^0.16.5",
-    "posthtml-parser": "^0.10.1",
+    "posthtml-parser": "^0.12.1",
     "posthtml-render": "^3.0.0",
-    "semver": "^5.7.1"
+    "semver": "^7.5.2"
   }
 }

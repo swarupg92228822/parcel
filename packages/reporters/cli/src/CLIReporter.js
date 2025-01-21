@@ -4,12 +4,18 @@ import type {Diagnostic} from '@parcel/diagnostic';
 import type {Color} from 'chalk';
 
 import {Reporter} from '@parcel/plugin';
-import {prettifyTime, prettyDiagnostic, throttle} from '@parcel/utils';
+import {
+  getProgressMessage,
+  prettifyTime,
+  prettyDiagnostic,
+  throttle,
+} from '@parcel/utils';
 import chalk from 'chalk';
 
-import {getProgressMessage, getTerminalWidth} from './utils';
+import {getTerminalWidth} from './utils';
 import logLevels from './logLevels';
 import bundleReport from './bundleReport';
+import phaseReport from './phaseReport';
 import {
   writeOut,
   updateSpinner,
@@ -24,6 +30,10 @@ import wrapAnsi from 'wrap-ansi';
 const THROTTLE_DELAY = 100;
 const seenWarnings = new Set();
 const seenPhases = new Set();
+const seenPhasesGen = new Set();
+
+let phaseStartTimes = {};
+let pendingIncrementalBuild = false;
 
 let statusThrottle = throttle((message: string) => {
   updateSpinner(message);
@@ -47,23 +57,23 @@ export async function _report(
       // Clear any previous output
       resetWindow();
 
-      if (options.serveOptions) {
-        persistMessage(
-          chalk.blue.bold(
-            `Server running at ${
-              options.serveOptions.https ? 'https' : 'http'
-            }://${options.serveOptions.host ?? 'localhost'}:${
-              options.serveOptions.port
-            }`,
-          ),
-        );
-      }
-
       break;
     }
     case 'buildProgress': {
       if (logLevelFilter < logLevels.info) {
         break;
+      }
+
+      if (pendingIncrementalBuild) {
+        pendingIncrementalBuild = false;
+        phaseStartTimes = {};
+        seenPhasesGen.clear();
+        seenPhases.clear();
+      }
+
+      if (!seenPhasesGen.has(event.phase)) {
+        phaseStartTimes[event.phase] = Date.now();
+        seenPhasesGen.add(event.phase);
       }
 
       if (!isTTY && logLevelFilter != logLevels.verbose) {
@@ -79,7 +89,6 @@ export async function _report(
           updateSpinner('Packaging & Optimizing...');
         }
         seenPhases.add(event.phase);
-
         break;
       }
 
@@ -98,6 +107,25 @@ export async function _report(
         break;
       }
 
+      phaseStartTimes['buildSuccess'] = Date.now();
+
+      if (
+        options.serveOptions &&
+        event.bundleGraph
+          .getEntryBundles()
+          .some(b => b.env.isBrowser() || b.type === 'html')
+      ) {
+        persistMessage(
+          chalk.blue.bold(
+            `Server running at ${
+              options.serveOptions.https ? 'https' : 'http'
+            }://${options.serveOptions.host ?? 'localhost'}:${
+              options.serveOptions.port
+            }`,
+          ),
+        );
+      }
+
       persistSpinner(
         'buildProgress',
         'success',
@@ -111,6 +139,12 @@ export async function _report(
           options.projectRoot,
           options.detailedReport?.assetsPerBundle,
         );
+      } else {
+        pendingIncrementalBuild = true;
+      }
+
+      if (process.env.PARCEL_SHOW_PHASE_TIMES) {
+        phaseReport(phaseStartTimes);
       }
       break;
     case 'buildFailure':
@@ -123,6 +157,22 @@ export async function _report(
       persistSpinner('buildProgress', 'error', chalk.red.bold('Build failed.'));
 
       await writeDiagnostic(options, event.diagnostics, 'red', true);
+      break;
+    case 'cache':
+      if (event.size > 500000) {
+        switch (event.phase) {
+          case 'start':
+            updateSpinner('Writing cache to disk');
+            break;
+          case 'end':
+            persistSpinner(
+              'cache',
+              'success',
+              chalk.grey.bold(`Cache written to disk`),
+            );
+            break;
+        }
+      }
       break;
     case 'log': {
       if (logLevelFilter < logLevels[event.level]) {
@@ -170,13 +220,14 @@ async function writeDiagnostic(
 ) {
   let columns = getTerminalWidth().columns;
   let indent = 2;
+  let spaceAfter = isError;
   for (let diagnostic of diagnostics) {
     let {message, stack, codeframe, hints, documentation} =
       await prettyDiagnostic(diagnostic, options, columns - indent);
     // $FlowFixMe[incompatible-use]
     message = chalk[color](message);
 
-    if (isError) {
+    if (spaceAfter) {
       writeOut('');
     }
 
@@ -221,9 +272,11 @@ async function writeDiagnostic(
         ),
       );
     }
+
+    spaceAfter = stack || codeframe || hints.length > 0 || documentation;
   }
 
-  if (isError) {
+  if (spaceAfter) {
     writeOut('');
   }
 }

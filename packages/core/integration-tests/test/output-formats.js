@@ -383,6 +383,7 @@ describe('output formats', function () {
                   language: 'js',
                   codeHighlights: [
                     {
+                      message: undefined,
                       start: {
                         line: 1,
                         column: 10,
@@ -551,14 +552,36 @@ describe('output formats', function () {
       };
 
       let out = [];
+      await run(
+        b,
+        {
+          output(o) {
+            out.push(o);
+          },
+        },
+        {},
+        {
+          external: () => external,
+        },
+      );
+
+      assert.deepEqual(out, [1, 2]);
+    });
+
+    it('should work with SWC helpers', async function () {
+      let b = await bundle(
+        path.join(__dirname, '/integration/formats/commonjs-helpers/index.js'),
+      );
+
+      let out = [];
       await run(b, {
-        require: () => external,
+        require,
         output(o) {
           out.push(o);
         },
       });
 
-      assert.deepEqual(out, [1, 2]);
+      assert.deepEqual(out[0].x, new Map());
     });
   });
 
@@ -725,6 +748,24 @@ describe('output formats', function () {
       );
     });
 
+    it('should support esmodule output with external modules (re-export child)', async function () {
+      let b = await bundle(
+        path.join(
+          __dirname,
+          '/integration/formats/esm-external/re-export-child.js',
+        ),
+      );
+
+      await assertESMExports(
+        b,
+        3,
+        {
+          lodash: () => lodash,
+        },
+        ns => ns.add(1, 2),
+      );
+    });
+
     it('should support importing sibling bundles in library mode', async function () {
       let b = await bundle(
         path.join(__dirname, '/integration/formats/esm-siblings/a.js'),
@@ -863,6 +904,7 @@ describe('output formats', function () {
                   language: 'js',
                   codeHighlights: [
                     {
+                      message: undefined,
                       start: {
                         line: 1,
                         column: 10,
@@ -1023,11 +1065,9 @@ describe('output formats', function () {
         .getBundles()
         .find(bundle => bundle.name.startsWith('async'));
       assert(
-        new RegExp(
-          `getBundleURL\\("[a-zA-Z0-9]+"\\) \\+ "` +
-            path.basename(asyncBundle.filePath) +
-            '"',
-        ).test(entry),
+        entry.includes(
+          `$parcel$resolve("${path.basename(asyncBundle.filePath)}")`,
+        ),
       );
     });
 
@@ -1062,9 +1102,9 @@ describe('output formats', function () {
       );
       assert(
         new RegExp(
-          'Promise.all\\(\\[\\n.+?new URL\\("' +
+          'Promise.all\\(\\[\\n.+?\\$parcel\\$resolve\\("' +
             path.basename(asyncCssBundle.filePath) +
-            '", import.meta.url\\).toString\\(\\)\\),\\n\\s*import\\("\\.\\/' +
+            '"\\)\\),\\n\\s*import\\("\\.\\/' +
             path.basename(asyncJsBundle.filePath) +
             '"\\)\\n\\s*\\]\\)',
         ).test(entry),
@@ -1098,6 +1138,7 @@ describe('output formats', function () {
       );
 
       assert(html.includes('<script type="module" src="/index'));
+      assert(html.includes('<script type="importmap"'));
 
       let bundles = b.getBundles();
       let entry = await outputFS.readFile(
@@ -1117,7 +1158,7 @@ describe('output formats', function () {
         // async import both bundles in parallel for performance
         assert(
           new RegExp(
-            `import\\("\\./" \\+ .+\\.resolve\\("${sharedBundle.publicId}"\\)\\),\\n\\s*import\\("./" \\+ .+\\.resolve\\("${bundle.publicId}"\\)\\)`,
+            `import\\("${sharedBundle.publicId}"\\),\\n\\s*import\\("${bundle.publicId}"\\)`,
           ).test(entry),
         );
       }
@@ -1251,7 +1292,8 @@ describe('output formats', function () {
 
       let ns = await run(b);
       assert.deepEqual(ns.test, true);
-      assert.deepEqual(ns.default, {test: true});
+      assert.deepEqual(ns.default, {test: true, 'foo-bar': true});
+      assert.deepEqual(ns['foo-bar'], true);
     });
 
     it('should support outputting .mjs files', async function () {
@@ -1427,6 +1469,34 @@ describe('output formats', function () {
     assert.deepEqual(calls, [[['a', 10]]]);
   });
 
+  it('should support external parallel dependencies', async function () {
+    let b = await bundle(
+      path.join(__dirname, 'integration/library-parallel-deps/index.js'),
+      {
+        mode: 'production',
+        defaultTargetOptions: {
+          shouldOptimize: false,
+        },
+      },
+    );
+
+    assertBundles(b, [
+      {
+        name: 'out.js',
+        assets: ['index.js'],
+      },
+      {
+        assets: ['foo.js'],
+      },
+    ]);
+
+    let res = await run(b);
+    assert.equal(res.default, 'foo bar');
+
+    let content = await outputFS.readFile(b.getBundles()[0].filePath, 'utf8');
+    assert(/import [^\s]+ from "\.\//.test(content));
+  });
+
   describe('global', function () {
     it.skip('should support split bundles between main script and workers', async function () {
       let b = await bundle(
@@ -1445,7 +1515,7 @@ describe('output formats', function () {
       assertBundles(b, [
         {
           type: 'js',
-          assets: ['bundle-manifest.js', 'get-worker-url.js', 'index.js'],
+          assets: ['get-worker-url.js', 'index.js'],
         },
         {type: 'html', assets: ['index.html']},
         {type: 'js', assets: ['lodash.js']},
@@ -1510,6 +1580,7 @@ describe('output formats', function () {
                 filePath: source,
                 codeHighlights: [
                   {
+                    message: undefined,
                     start: {
                       line: 1,
                       column: 21,

@@ -1,6 +1,6 @@
 {
   "name": "@parcel/fs",
-  "version": "2.6.0",
+  "version": "2.13.3",
   "description": "Blazing fast, zero configuration web application bundler",
   "license": "MIT",
   "publishConfig": {
@@ -18,27 +18,31 @@
   "source": "src/index.js",
   "types": "index.d.ts",
   "engines": {
-    "node": ">= 12.0.0"
+    "node": ">= 16.0.0"
   },
   "targets": {
     "types": false,
     "main": {
       "includeNodeModules": {
         "@parcel/core": false,
-        "@parcel/fs-search": false,
-        "@parcel/types": false,
+        "@parcel/feature-flags": false,
+        "@parcel/rust": false,
+        "@parcel/types-internal": false,
         "@parcel/utils": false,
         "@parcel/watcher": false,
+        "@parcel/watcher-watchman-js": false,
         "@parcel/workers": false
       }
     },
     "browser": {
       "includeNodeModules": {
         "@parcel/core": false,
-        "@parcel/fs-search": false,
-        "@parcel/types": false,
+        "@parcel/feature-flags": false,
+        "@parcel/rust": false,
+        "@parcel/types-internal": false,
         "@parcel/utils": false,
         "@parcel/watcher": false,
+        "@parcel/watcher-watchman-js": false,
         "@parcel/workers": false
       }
     }
@@ -48,21 +52,22 @@
     "check-ts": "tsc --noEmit index.d.ts"
   },
   "dependencies": {
-    "@parcel/fs-search": "2.6.0",
-    "@parcel/types": "2.6.0",
-    "@parcel/utils": "2.6.0",
-    "@parcel/watcher": "^2.0.0",
-    "@parcel/workers": "2.6.0"
+    "@parcel/feature-flags": "2.13.3",
+    "@parcel/rust": "2.13.3",
+    "@parcel/types-internal": "2.13.3",
+    "@parcel/utils": "2.13.3",
+    "@parcel/watcher": "^2.0.7",
+    "@parcel/workers": "2.13.3"
   },
   "devDependencies": {
-    "@parcel/fs-write-stream-atomic": "2.6.0",
+    "@parcel/watcher-watchman-js": "2.13.3",
     "graceful-fs": "^4.2.4",
     "ncp": "^2.0.0",
     "nullthrows": "^1.1.1",
     "utility-types": "^3.10.0"
   },
   "peerDependencies": {
-    "@parcel/core": "^2.6.0"
+    "@parcel/core": "^2.13.3"
   },
   "browser": {
     "@parcel/fs": "./lib/browser.js",

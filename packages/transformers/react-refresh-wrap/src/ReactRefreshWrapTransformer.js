@@ -18,7 +18,10 @@ function shouldExclude(asset, options) {
         v =>
           v.specifier === 'react' ||
           v.specifier === 'react/jsx-runtime' ||
-          v.specifier === 'react/jsx-dev-runtime',
+          v.specifier === 'react/jsx-dev-runtime' ||
+          v.specifier === '@emotion/react' ||
+          v.specifier === '@emotion/react/jsx-runtime' ||
+          v.specifier === '@emotion/react/jsx-dev-runtime',
       )
   );
 }
@@ -38,16 +41,17 @@ export default (new Transformer({
     let name = `$parcel$ReactRefreshHelpers$${asset.id.slice(-4)}`;
 
     code = `var ${name} = require(${JSON.stringify(wrapperPath)});
-var prevRefreshReg = window.$RefreshReg$;
-var prevRefreshSig = window.$RefreshSig$;
+${name}.init();
+var prevRefreshReg = globalThis.$RefreshReg$;
+var prevRefreshSig = globalThis.$RefreshSig$;
 ${name}.prelude(module);
 
 try {
 ${code}
   ${name}.postlude(module);
 } finally {
-  window.$RefreshReg$ = prevRefreshReg;
-  window.$RefreshSig$ = prevRefreshSig;
+  globalThis.$RefreshReg$ = prevRefreshReg;
+  globalThis.$RefreshSig$ = prevRefreshSig;
 }`;
 
     asset.setCode(code);

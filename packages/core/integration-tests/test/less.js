@@ -1,11 +1,11 @@
 import assert from 'assert';
 import path from 'path';
 import {
-  bundle,
-  run,
   assertBundles,
+  bundle,
   distDir,
   outputFS,
+  run,
 } from '@parcel/test-utils';
 import {md} from '@parcel/diagnostic';
 
@@ -284,5 +284,12 @@ describe('less', function () {
         'background: url("data:image/svg+xml,%3C%3Fxml version%3D%221.0%22%3F%3E%3Csvg%3E%3C%2Fsvg%3E")',
       ),
     );
+  });
+
+  it('should support the less package exports condition', async function () {
+    await bundle(path.join(__dirname, '/integration/less-exports/index.less'));
+
+    let css = await outputFS.readFile(path.join(distDir, 'index.css'), 'utf8');
+    assert(css.includes('.a'));
   });
 });

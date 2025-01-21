@@ -31,6 +31,9 @@ import type {FileSystem} from '@parcel/fs';
 import type {Cache} from '@parcel/cache';
 import type {PackageManager} from '@parcel/package-manager';
 import type {ProjectPath} from './projectPath';
+import type {Event} from '@parcel/watcher';
+import type {FeatureFlags} from '@parcel/feature-flags';
+import type {BackendType} from '@parcel/watcher';
 
 export type ParcelPluginNode = {|
   packageName: PackageName,
@@ -113,6 +116,17 @@ export const Priority = {
   lazy: 2,
 };
 
+// Must match package_json.rs in the parcel-resolver crate.
+export const ExportsCondition = {
+  import: 1 << 0,
+  require: 1 << 1,
+  module: 1 << 2,
+  style: 1 << 12,
+  sass: 1 << 13,
+  less: 1 << 14,
+  stylus: 1 << 15,
+};
+
 export type Dependency = {|
   id: string,
   specifier: DependencySpecifier,
@@ -124,13 +138,17 @@ export type Dependency = {|
   isOptional: boolean,
   loc: ?InternalSourceLocation,
   env: Environment,
+  packageConditions?: number,
+  customPackageConditions?: Array<string>,
   meta: Meta,
   resolverMeta?: ?Meta,
+  resolverPriority?: $Values<typeof Priority>,
   target: ?Target,
   sourceAssetId: ?string,
   sourcePath: ?ProjectPath,
   sourceAssetType?: ?string,
   resolveFrom: ?ProjectPath,
+  range: ?SemverRange,
   symbols: ?Map<
     Symbol,
     {|
@@ -154,7 +172,6 @@ export const BundleBehaviorNames: Array<$Keys<typeof BundleBehavior>> =
 export type Asset = {|
   id: ContentKey,
   committed: boolean,
-  hash: ?string,
   filePath: ProjectPath,
   query: ?string,
   type: string,
@@ -228,12 +245,22 @@ export type InternalFileCreateInvalidation =
   | InternalGlobInvalidation
   | InternalFileAboveInvalidation;
 
+export type Invalidations = {|
+  invalidateOnFileChange: Set<ProjectPath>,
+  invalidateOnFileCreate: Array<InternalFileCreateInvalidation>,
+  invalidateOnEnvChange: Set<string>,
+  invalidateOnOptionChange: Set<string>,
+  invalidateOnStartup: boolean,
+  invalidateOnBuild: boolean,
+|};
+
 export type DevDepRequest = {|
   specifier: DependencySpecifier,
   resolveFrom: ProjectPath,
   hash: string,
   invalidateOnFileCreate?: Array<InternalFileCreateInvalidation>,
   invalidateOnFileChange?: Set<ProjectPath>,
+  invalidateOnStartup?: boolean,
   additionalInvalidations?: Array<{|
     specifier: DependencySpecifier,
     resolveFrom: ProjectPath,
@@ -241,26 +268,36 @@ export type DevDepRequest = {|
   |}>,
 |};
 
+declare type GlobPattern = string;
+
 export type ParcelOptions = {|
   entries: Array<ProjectPath>,
   config?: DependencySpecifier,
   defaultConfig?: DependencySpecifier,
   env: EnvMap,
+  parcelVersion: string,
   targets: ?(Array<string> | {+[string]: TargetDescriptor, ...}),
-
   shouldDisableCache: boolean,
   cacheDir: FilePath,
+  watchDir: FilePath,
+  watchIgnore?: Array<FilePath | GlobPattern>,
+  watchBackend?: BackendType,
   mode: BuildMode,
   hmrOptions: ?HMROptions,
   shouldContentHash: boolean,
   serveOptions: ServerOptions | false,
   shouldBuildLazily: boolean,
+  lazyIncludes: RegExp[],
+  lazyExcludes: RegExp[],
+  shouldBundleIncrementally: boolean,
   shouldAutoInstall: boolean,
   logLevel: LogLevel,
   projectRoot: FilePath,
   shouldProfile: boolean,
+  shouldTrace: boolean,
   shouldPatchConsole: boolean,
   detailedReport?: ?DetailedReportOptions,
+  unstableFileInvalidations?: Array<Event>,
 
   inputFS: FileSystem,
   outputFS: FileSystem,
@@ -283,6 +320,8 @@ export type ParcelOptions = {|
     +outputFormat?: OutputFormat,
     +isLibrary?: boolean,
   |},
+
+  +featureFlags: FeatureFlags,
 |};
 
 export type AssetNode = {|
@@ -306,13 +345,31 @@ export type DependencyNode = {|
   /** dependency was deferred (= no used symbols (in immediate parents) & side-effect free) */
   hasDeferred?: boolean,
   usedSymbolsDown: Set<Symbol>,
-  usedSymbolsUp: Set<Symbol>,
-  /** for the "down" pass, the dependency resolution asset needs to be updated */
+  /**
+   * a requested symbol -> either
+   *  - if ambiguous (e.g. dependency to asset group with both CSS modules and JS asset): undefined
+   *  - if external: null
+   *  - the asset it resolved to, and the potentially renamed export name
+   */
+  usedSymbolsUp: Map<
+    Symbol,
+    {|asset: ContentKey, symbol: ?Symbol|} | void | null,
+  >,
+  /*
+   * For the "down" pass, the resolutionAsset needs to be updated.
+   * This is set when the AssetGraphBuilder adds/removes/updates nodes.
+   */
   usedSymbolsDownDirty: boolean,
-  /** for the "up" pass, the parent asset needs to be updated */
-  usedSymbolsUpDirtyUp: boolean,
-  /** for the "up" pass, the dependency resolution asset needs to be updated */
+  /**
+   * In the down pass, `usedSymbolsDown` changed. This needs to be propagated to the resolutionAsset
+   * in the up pass.
+   */
   usedSymbolsUpDirtyDown: boolean,
+  /**
+   * In the up pass, `usedSymbolsUp` changed. This needs to be propagated to the sourceAsset in the
+   * up pass.
+   */
+  usedSymbolsUpDirtyUp: boolean,
   /** dependency was excluded (= no used symbols (globally) & side-effect free) */
   excluded: boolean,
 |};
@@ -331,6 +388,7 @@ export type AssetRequestInput = {|
   optionsRef: SharedReference,
   isURL?: boolean,
   query?: ?string,
+  isSingleChangeRebuild?: boolean,
 |};
 
 export type AssetRequestResult = Array<Asset>;
@@ -352,7 +410,6 @@ export type AssetGroupNode = {|
 
 export type TransformationRequest = {|
   ...AssetGroup,
-  invalidations: Array<RequestInvalidation>,
   invalidateReason: number,
   devDeps: Map<PackageName, string>,
   invalidDevDeps: Array<{|
@@ -430,11 +487,16 @@ export type Config = {|
   cacheKey: ?string,
   result: ConfigResult,
   invalidateOnFileChange: Set<ProjectPath>,
+  invalidateOnConfigKeyChange: Array<{|
+    filePath: ProjectPath,
+    configKey: string,
+  |}>,
   invalidateOnFileCreate: Array<InternalFileCreateInvalidation>,
   invalidateOnEnvChange: Set<string>,
   invalidateOnOptionChange: Set<string>,
   devDeps: Array<InternalDevDepOptions>,
   invalidateOnStartup: boolean,
+  invalidateOnBuild: boolean,
 |};
 
 export type EntryRequest = {|
@@ -479,6 +541,7 @@ export type Bundle = {|
   name: ?string,
   displayName: ?string,
   pipeline: ?string,
+  manualSharedBundle?: ?string,
 |};
 
 export type BundleNode = {|
@@ -516,4 +579,4 @@ export type ValidationOpts = {|
   configCachePath: string,
 |};
 
-export type ReportFn = (event: ReporterEvent) => void;
+export type ReportFn = (event: ReporterEvent) => void | Promise<void>;

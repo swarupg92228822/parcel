@@ -1,14 +1,23 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
 
-use crate::id;
 use serde::{Deserialize, Serialize};
-use swc_atoms::JsWord;
-use swc_common::{Mark, Span, SyntaxContext, DUMMY_SP};
-use swc_ecmascript::ast::{self, Id};
+use swc_core::{
+  common::{
+    errors::{DiagnosticBuilder, Emitter},
+    Mark, SourceMap, Span, SyntaxContext, DUMMY_SP,
+  },
+  ecma::{
+    ast::{self, Ident, IdentName},
+    atoms::{js_word, JsWord},
+  },
+};
 
-pub fn match_member_expr(expr: &ast::MemberExpr, idents: Vec<&str>, decls: &HashSet<Id>) -> bool {
-  use ast::{Expr, Ident, Lit, MemberProp, Str};
+pub fn is_unresolved(ident: &Ident, unresolved_mark: Mark) -> bool {
+  ident.ctxt.outer() == unresolved_mark
+}
+
+pub fn match_member_expr(expr: &ast::MemberExpr, idents: Vec<&str>, unresolved_mark: Mark) -> bool {
+  use ast::{Expr, Lit, MemberProp, Str};
 
   let mut member = expr;
   let mut idents = idents;
@@ -22,7 +31,7 @@ pub fn match_member_expr(expr: &ast::MemberExpr, idents: Vec<&str>, decls: &Hash
           return false;
         }
       }
-      MemberProp::Ident(Ident { ref sym, .. }) => sym,
+      MemberProp::Ident(IdentName { ref sym, .. }) => sym,
       _ => return false,
     };
 
@@ -33,7 +42,9 @@ pub fn match_member_expr(expr: &ast::MemberExpr, idents: Vec<&str>, decls: &Hash
     match &*member.obj {
       Expr::Member(m) => member = m,
       Expr::Ident(id) => {
-        return idents.len() == 1 && &id.sym == idents.pop().unwrap() && !decls.contains(&id!(id));
+        return idents.len() == 1
+          && id.sym == idents.pop().unwrap()
+          && is_unresolved(&id, unresolved_mark);
       }
       _ => return false,
     }
@@ -42,7 +53,10 @@ pub fn match_member_expr(expr: &ast::MemberExpr, idents: Vec<&str>, decls: &Hash
   false
 }
 
-pub fn create_require(specifier: swc_atoms::JsWord) -> ast::CallExpr {
+pub fn create_require(
+  specifier: swc_core::ecma::atoms::JsWord,
+  unresolved_mark: Mark,
+) -> ast::CallExpr {
   let mut normalized_specifier = specifier;
   if normalized_specifier.starts_with("node:") {
     normalized_specifier = normalized_specifier.replace("node:", "").into();
@@ -52,19 +66,19 @@ pub fn create_require(specifier: swc_atoms::JsWord) -> ast::CallExpr {
     callee: ast::Callee::Expr(Box::new(ast::Expr::Ident(ast::Ident::new(
       "require".into(),
       DUMMY_SP,
+      SyntaxContext::empty().apply_mark(unresolved_mark),
     )))),
     args: vec![ast::ExprOrSpread {
       expr: Box::new(ast::Expr::Lit(ast::Lit::Str(normalized_specifier.into()))),
       spread: None,
     }],
     span: DUMMY_SP,
+    ctxt: SyntaxContext::empty(),
     type_args: None,
   }
 }
 
-fn is_marked(span: Span, mark: Mark) -> bool {
-  let mut ctxt = span.ctxt();
-
+fn is_marked(mut ctxt: SyntaxContext, mark: Mark) -> bool {
   loop {
     let m = ctxt.remove_mark();
     if m == Mark::root() {
@@ -85,7 +99,7 @@ pub fn match_str(node: &ast::Expr) -> Option<(JsWord, Span)> {
     Expr::Lit(Lit::Str(s)) => Some((s.value.clone(), s.span)),
     // `string`
     Expr::Tpl(tpl) if tpl.quasis.len() == 1 && tpl.exprs.is_empty() => {
-      Some((tpl.quasis[0].raw.clone(), tpl.span))
+      Some(((*tpl.quasis[0].raw).into(), tpl.span))
     }
     _ => None,
   }
@@ -93,7 +107,7 @@ pub fn match_str(node: &ast::Expr) -> Option<(JsWord, Span)> {
 
 pub fn match_property_name(node: &ast::MemberExpr) -> Option<(JsWord, Span)> {
   match &node.prop {
-    ast::MemberProp::Computed(s) => match_str(&*s.expr),
+    ast::MemberProp::Computed(s) => match_str(&s.expr),
     ast::MemberProp::Ident(id) => Some((id.sym.clone(), id.span)),
     ast::MemberProp::PrivateName(_) => None,
   }
@@ -114,7 +128,7 @@ pub fn match_export_name_ident(name: &ast::ModuleExportName) -> &ast::Ident {
   }
 }
 
-pub fn match_require(node: &ast::Expr, decls: &HashSet<Id>, ignore_mark: Mark) -> Option<JsWord> {
+pub fn match_require(node: &ast::Expr, unresolved_mark: Mark, ignore_mark: Mark) -> Option<JsWord> {
   use ast::*;
 
   match node {
@@ -122,20 +136,20 @@ pub fn match_require(node: &ast::Expr, decls: &HashSet<Id>, ignore_mark: Mark) -
       Callee::Expr(expr) => match &**expr {
         Expr::Ident(ident) => {
           if ident.sym == js_word!("require")
-            && !decls.contains(&(ident.sym.clone(), ident.span.ctxt))
-            && !is_marked(ident.span, ignore_mark)
+            && is_unresolved(&ident, unresolved_mark)
+            && !is_marked(ident.ctxt, ignore_mark)
           {
-            if let Some(arg) = call.args.get(0) {
-              return match_str(&*arg.expr).map(|(name, _)| name);
+            if let Some(arg) = call.args.first() {
+              return match_str(&arg.expr).map(|(name, _)| name);
             }
           }
 
           None
         }
         Expr::Member(member) => {
-          if match_member_expr(member, vec!["module", "require"], decls) {
-            if let Some(arg) = call.args.get(0) {
-              return match_str(&*arg.expr).map(|(name, _)| name);
+          if match_member_expr(member, vec!["module", "require"], unresolved_mark) {
+            if let Some(arg) = call.args.first() {
+              return match_str(&arg.expr).map(|(name, _)| name);
             }
           }
 
@@ -149,14 +163,14 @@ pub fn match_require(node: &ast::Expr, decls: &HashSet<Id>, ignore_mark: Mark) -
   }
 }
 
-pub fn match_import(node: &ast::Expr, ignore_mark: Mark) -> Option<JsWord> {
+pub fn match_import(node: &ast::Expr) -> Option<JsWord> {
   use ast::*;
 
   match node {
     Expr::Call(call) => match &call.callee {
-      Callee::Import(ident) if !is_marked(ident.span, ignore_mark) => {
-        if let Some(arg) = call.args.get(0) {
-          return match_str(&*arg.expr).map(|(name, _)| name);
+      Callee::Import(_) => {
+        if let Some(arg) = call.args.first() {
+          return match_str(&arg.expr).map(|(name, _)| name);
         }
         None
       }
@@ -168,35 +182,43 @@ pub fn match_import(node: &ast::Expr, ignore_mark: Mark) -> Option<JsWord> {
 
 // `name` must not be an existing binding.
 pub fn create_global_decl_stmt(
-  name: swc_atoms::JsWord,
+  name: swc_core::ecma::atoms::JsWord,
   init: ast::Expr,
   global_mark: Mark,
 ) -> (ast::Stmt, SyntaxContext) {
   // The correct value would actually be `DUMMY_SP.apply_mark(Mark::fresh(Mark::root()))`.
   // But this saves us from running the resolver again in some cases.
-  let span = DUMMY_SP.apply_mark(global_mark);
+  let ctxt = SyntaxContext::empty().apply_mark(global_mark);
 
   (
-    ast::Stmt::Decl(ast::Decl::Var(ast::VarDecl {
+    ast::Stmt::Decl(ast::Decl::Var(Box::new(ast::VarDecl {
       kind: ast::VarDeclKind::Var,
       declare: false,
       span: DUMMY_SP,
+      ctxt,
       decls: vec![ast::VarDeclarator {
-        name: ast::Pat::Ident(ast::BindingIdent::from(ast::Ident::new(name, span))),
+        name: ast::Pat::Ident(ast::BindingIdent::from(ast::Ident::new(
+          name, DUMMY_SP, ctxt,
+        ))),
         span: DUMMY_SP,
         definite: false,
         init: Some(Box::new(init)),
       }],
-    })),
-    span.ctxt,
+    }))),
+    ctxt,
   )
 }
 
 pub fn get_undefined_ident(unresolved_mark: Mark) -> ast::Ident {
-  ast::Ident::new(js_word!("undefined"), DUMMY_SP.apply_mark(unresolved_mark))
+  ast::Ident::new(
+    js_word!("undefined"),
+    DUMMY_SP,
+    SyntaxContext::empty().apply_mark(unresolved_mark),
+  )
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+/// Corresponds to the JS SourceLocation type (1-based, end exclusive)
 pub struct SourceLocation {
   pub start_line: usize,
   pub start_col: usize,
@@ -205,26 +227,25 @@ pub struct SourceLocation {
 }
 
 impl SourceLocation {
-  pub fn from(source_map: &swc_common::SourceMap, span: swc_common::Span) -> Self {
+  pub fn from(source_map: &SourceMap, span: Span) -> Self {
     if span.lo.is_dummy() || span.hi.is_dummy() {
       return SourceLocation {
         start_line: 1,
         start_col: 1,
         end_line: 1,
-        end_col: 1,
+        end_col: 2,
       };
     }
 
     let start = source_map.lookup_char_pos(span.lo);
     let end = source_map.lookup_char_pos(span.hi);
-    // - SWC's columns are exclusive, ours are inclusive (column - 1)
-    // - SWC has 0-based columns, ours are 1-based (column + 1)
-    // = +-0
+    // SWC's columns are exclusive, ours are exclusive
+    // SWC has 0-based columns, ours are 1-based (column + 1)
     SourceLocation {
       start_line: start.line,
       start_col: start.col_display + 1,
       end_line: end.line,
-      end_col: end.col_display,
+      end_col: end.col_display + 1,
     }
   }
 }
@@ -238,13 +259,13 @@ impl PartialOrd for SourceLocation {
   }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct CodeHighlight {
   pub message: Option<String>,
   pub loc: SourceLocation,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct Diagnostic {
   pub message: String,
   pub code_highlights: Option<Vec<CodeHighlight>>,
@@ -268,6 +289,12 @@ pub enum DiagnosticSeverity {
 pub enum SourceType {
   Script,
   Module,
+}
+
+impl Default for SourceType {
+  fn default() -> Self {
+    SourceType::Module
+  }
 }
 
 #[derive(Debug)]
@@ -306,13 +333,14 @@ pub enum BailoutReason {
   ModuleReassignment,
   NonStaticDynamicImport,
   NonStaticAccess,
+  ThisInExport,
 }
 
 impl BailoutReason {
   fn info(&self) -> (&str, &str) {
     match self {
       BailoutReason::NonTopLevelRequire => (
-        "Conditional or non-top-level `require()` call. This causes the resolved module and all dependendencies to be wrapped.",
+        "Conditional or non-top-level `require()` call. This causes the resolved module and all dependencies to be wrapped.",
         "https://parceljs.org/features/scope-hoisting/#avoid-conditional-require()"
       ),
       BailoutReason::NonStaticDestructuring => (
@@ -355,6 +383,10 @@ impl BailoutReason {
         "Non-static access of an `import` or `require`. This causes tree shaking to be disabled for the resolved module.",
         "https://parceljs.org/features/scope-hoisting/#dynamic-member-accesses"
       ),
+      BailoutReason::ThisInExport => (
+        "Module contains `this` access of an exported value. This causes the module to be wrapped and tree-shaking to be disabled.",
+        "https://parceljs.org/features/scope-hoisting/#avoiding-bail-outs"
+      ),
     }
   }
 }
@@ -364,11 +396,11 @@ macro_rules! fold_member_expr_skip_prop {
   () => {
     fn fold_member_expr(
       &mut self,
-      mut node: swc_ecmascript::ast::MemberExpr,
-    ) -> swc_ecmascript::ast::MemberExpr {
+      mut node: swc_core::ecma::ast::MemberExpr,
+    ) -> swc_core::ecma::ast::MemberExpr {
       node.obj = node.obj.fold_with(self);
 
-      if let swc_ecmascript::ast::MemberProp::Computed(_) = node.prop {
+      if let swc_core::ecma::ast::MemberProp::Computed(_) = node.prop {
         node.prop = node.prop.fold_with(self);
       }
 
@@ -382,4 +414,64 @@ macro_rules! id {
   ($ident: expr) => {
     $ident.to_id()
   };
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ErrorBuffer(
+  std::sync::Arc<parking_lot::Mutex<Vec<swc_core::common::errors::Diagnostic>>>,
+);
+
+impl Emitter for ErrorBuffer {
+  fn emit(&mut self, db: &DiagnosticBuilder) {
+    self.0.lock().push((**db).clone());
+  }
+}
+
+pub fn error_buffer_to_diagnostics(
+  error_buffer: &ErrorBuffer,
+  source_map: &SourceMap,
+) -> Vec<Diagnostic> {
+  let s = error_buffer.0.lock().clone();
+  s.iter()
+    .map(|diagnostic| {
+      let message = diagnostic.message();
+      let span = diagnostic.span.clone();
+      let suggestions = diagnostic.suggestions.clone();
+
+      let span_labels = span.span_labels();
+      let code_highlights = if !span_labels.is_empty() {
+        let mut highlights = vec![];
+        for span_label in span_labels {
+          highlights.push(CodeHighlight {
+            message: span_label.label,
+            loc: SourceLocation::from(source_map, span_label.span),
+          });
+        }
+
+        Some(highlights)
+      } else {
+        None
+      };
+
+      let hints = if !suggestions.is_empty() {
+        Some(
+          suggestions
+            .into_iter()
+            .map(|suggestion| suggestion.msg)
+            .collect(),
+        )
+      } else {
+        None
+      };
+
+      Diagnostic {
+        message,
+        code_highlights,
+        hints,
+        show_environment: false,
+        severity: DiagnosticSeverity::Error,
+        documentation_url: None,
+      }
+    })
+    .collect()
 }

@@ -2,7 +2,8 @@
 
 import assert from 'assert';
 import path from 'path';
-import {bundle} from '@parcel/test-utils';
+import {bundle, fsFixture, overlayFS} from '@parcel/test-utils';
+import type {BundleGraph, BundleGroup, PackagedBundle} from '@parcel/types';
 
 describe('BundleGraph', () => {
   it('can traverse assets across bundles and contexts', async () => {
@@ -57,10 +58,6 @@ describe('BundleGraph', () => {
       },
       {
         type: 'asset',
-        value: 'bundle-url.js',
-      },
-      {
-        type: 'asset',
         value: 'runtime.js',
       },
       {
@@ -69,12 +66,71 @@ describe('BundleGraph', () => {
       },
       {
         type: 'asset',
-        value: 'bundle-url.js',
-      },
-      {
-        type: 'asset',
         value: 'esmodule-helpers.js',
       },
     ]);
+  });
+
+  describe('getBundlesInBundleGroup', () => {
+    let bundleGraph: BundleGraph<PackagedBundle>;
+    let bundleGroup: BundleGroup;
+    let dir = path.join(__dirname, 'get-bundles-in-bundle-group');
+
+    before(async () => {
+      await overlayFS.mkdirp(dir);
+
+      await fsFixture(overlayFS, dir)`
+        logo.svg:
+          <svg></svg>
+
+        index.jsx:
+          import logo from 'data-url:./logo.svg';
+
+        yarn.lock: {}
+      `;
+
+      bundleGraph = await bundle(path.join(dir, 'index.jsx'), {
+        inputFS: overlayFS,
+      });
+
+      bundleGroup = bundleGraph.getBundleGroupsContainingBundle(
+        bundleGraph.getBundles({includeInline: true})[0],
+      )[0];
+    });
+
+    after(async () => {
+      await overlayFS.rimraf(dir);
+    });
+
+    it('does not return inlineAssets by default', () => {
+      const bundles = bundleGraph.getBundlesInBundleGroup(bundleGroup);
+
+      assert.deepEqual(
+        bundles.map(b => b.bundleBehavior),
+        [null],
+      );
+    });
+
+    it('does not return inlineAssets when requested', () => {
+      const bundles = bundleGraph.getBundlesInBundleGroup(bundleGroup, {
+        includeInline: false,
+      });
+
+      assert.deepEqual(
+        bundles.map(b => b.bundleBehavior),
+        [null],
+      );
+    });
+
+    it('returns inlineAssets when requested', () => {
+      const bundles = bundleGraph.getBundlesInBundleGroup(bundleGroup, {
+        includeInline: true,
+      });
+
+      assert.deepEqual(
+        bundles.map(b => b.bundleBehavior),
+        [null, 'inline'],
+      );
+    });
   });
 });

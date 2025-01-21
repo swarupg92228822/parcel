@@ -1,15 +1,21 @@
 // @flow strict-local
 
-import type {Readable} from 'stream';
+import type {Readable, Writable} from 'stream';
 import type {FilePath} from '@parcel/types';
 import type {FileSystem} from '@parcel/fs';
 import type {Cache} from './types';
 
+import stream from 'stream';
 import path from 'path';
+import {promisify} from 'util';
 import logger from '@parcel/logger';
 import {serialize, deserialize, registerSerializableClass} from '@parcel/core';
 // flowlint-next-line untyped-import:off
 import packageJson from '../package.json';
+
+const pipeline: (Readable, Writable) => Promise<void> = promisify(
+  stream.pipeline,
+);
 
 export class FSCache implements Cache {
   fs: FileSystem;
@@ -45,12 +51,10 @@ export class FSCache implements Cache {
   }
 
   setStream(key: string, stream: Readable): Promise<void> {
-    return new Promise((resolve, reject) => {
-      stream
-        .pipe(this.fs.createWriteStream(this._getCachePath(`${key}-large`)))
-        .on('error', reject)
-        .on('finish', resolve);
-    });
+    return pipeline(
+      stream,
+      this.fs.createWriteStream(this._getCachePath(`${key}-large`)),
+    );
   }
 
   has(key: string): Promise<boolean> {
@@ -85,8 +89,18 @@ export class FSCache implements Cache {
     return this.fs.readFile(this._getCachePath(`${key}-large`));
   }
 
-  async setLargeBlob(key: string, contents: Buffer | string): Promise<void> {
-    await this.fs.writeFile(this._getCachePath(`${key}-large`), contents);
+  async setLargeBlob(
+    key: string,
+    contents: Buffer | string,
+    options?: {|signal?: AbortSignal|},
+  ): Promise<void> {
+    await this.fs.writeFile(this._getCachePath(`${key}-large`), contents, {
+      signal: options?.signal,
+    });
+  }
+
+  async deleteLargeBlob(key: string): Promise<void> {
+    await this.fs.rimraf(this._getCachePath(`${key}-large`));
   }
 
   async get<T>(key: string): Promise<?T> {
@@ -111,6 +125,10 @@ export class FSCache implements Cache {
     } catch (err) {
       logger.error(err, '@parcel/cache');
     }
+  }
+
+  refresh(): void {
+    // NOOP
   }
 }
 

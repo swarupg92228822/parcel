@@ -11,6 +11,7 @@ import {
   ncp,
 } from '@parcel/test-utils';
 import {symlinkSync} from 'fs';
+import nullthrows from 'nullthrows';
 
 const inputDir = path.join(__dirname, '/input');
 
@@ -355,6 +356,45 @@ describe('transpilation', function () {
     });
   });
 
+  it('should support commonjs and esm versions of @swc/helpers', async function () {
+    let b = await bundle(
+      path.join(__dirname, '/integration/swc-helpers-library/index.js'),
+    );
+
+    let file = await outputFS.readFile(
+      nullthrows(b.getBundles().find(b => b.env.outputFormat === 'commonjs'))
+        .filePath,
+      'utf8',
+    );
+    assert(file.includes('@swc/helpers/cjs/_class_call_check.cjs'));
+
+    file = await outputFS.readFile(
+      nullthrows(b.getBundles().find(b => b.env.outputFormat === 'esmodule'))
+        .filePath,
+      'utf8',
+    );
+    assert(file.includes('@swc/helpers/_/_class_call_check'));
+  });
+
+  it('should support commonjs versions of @swc/helpers without scope hoisting', async function () {
+    let b = await bundle(
+      path.join(__dirname, '/integration/swc-helpers-library/index.js'),
+      {
+        targets: {
+          test: {
+            distDir,
+            isLibrary: true,
+            scopeHoist: false,
+          },
+        },
+      },
+    );
+
+    let file = await outputFS.readFile(b.getBundles()[0].filePath, 'utf8');
+    assert(file.includes('@swc/helpers/cjs/_class_call_check.cjs'));
+    await run(b);
+  });
+
   it('should print errors from transpilation', async function () {
     let source = path.join(
       __dirname,
@@ -369,14 +409,14 @@ describe('transpilation', function () {
             {
               codeHighlights: [
                 {
-                  message: null,
+                  message: undefined,
                   start: {
-                    column: 15,
-                    line: 3,
+                    column: 1,
+                    line: 1,
                   },
                   end: {
-                    column: 43,
-                    line: 3,
+                    column: 12,
+                    line: 1,
                   },
                 },
               ],
@@ -384,7 +424,7 @@ describe('transpilation', function () {
             },
           ],
           hints: null,
-          message: 'Spread children are not supported in React.',
+          message: 'pragma cannot be set when runtime is automatic',
           origin: '@parcel/transformer-js',
         },
         {
@@ -392,14 +432,14 @@ describe('transpilation', function () {
             {
               codeHighlights: [
                 {
-                  message: null,
+                  message: undefined,
                   start: {
-                    column: 4,
-                    line: 7,
+                    column: 3,
+                    line: 9,
                   },
                   end: {
                     column: 4,
-                    line: 7,
+                    line: 9,
                   },
                 },
               ],

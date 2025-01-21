@@ -8,6 +8,13 @@
       "@parcel/transformer-worklet",
       "..."
     ],
+    "*.mdx": [
+      // For backward compatibility, include the old transformer
+      // so it is used if already installed in the project.
+      // Otherwise, the JS transformer will handle MDX.
+      "@parcel/transformer-mdx",
+      "@parcel/transformer-js"
+    ],
     "*.{js,mjs,jsm,jsx,es6,cjs,ts,tsx}": [
       "@parcel/transformer-babel",
       "@parcel/transformer-js",
@@ -33,29 +40,31 @@
     "*.pug": ["@parcel/transformer-pug"],
     "*.coffee": ["@parcel/transformer-coffeescript"],
     "*.elm": ["@parcel/transformer-elm"],
-    "*.mdx": ["@parcel/transformer-mdx"],
     "*.vue": ["@parcel/transformer-vue"],
     "template:*.vue": ["@parcel/transformer-vue"],
     "script:*.vue": ["@parcel/transformer-vue"],
     "style:*.vue": ["@parcel/transformer-vue"],
     "custom:*.vue": ["@parcel/transformer-vue"],
-    "*.{png,jpg,jpeg,webp,gif,tiff,avif,heic,heif}": ["@parcel/transformer-image"],
+    "*.{png,jpg,jpeg,webp,gif,tiff,avif,heic,heif}": [
+      "@parcel/transformer-image"
+    ],
     "*.svg": ["@parcel/transformer-svg"],
     "*.{xml,rss,atom}": ["@parcel/transformer-xml"],
+    "*.node": ["@parcel/transformer-node"],
     "url:*": ["...", "@parcel/transformer-raw"]
   },
   "namers": ["@parcel/namer-default"],
   "runtimes": [
+    "@parcel/runtime-rsc",
     "@parcel/runtime-js",
     "@parcel/runtime-browser-hmr",
-    "@parcel/runtime-react-refresh",
     "@parcel/runtime-service-worker"
   ],
   "optimizers": {
     "data-url:*": ["...", "@parcel/optimizer-data-url"],
     "*.css": ["@parcel/optimizer-css"],
     "*.{html,xhtml}": ["@parcel/optimizer-htmlnano"],
-    "*.{js,mjs,cjs}": ["@parcel/optimizer-terser"],
+    "*.{js,mjs,cjs}": ["@parcel/optimizer-swc"],
     "*.svg": ["@parcel/optimizer-svgo"],
     "*.{jpg,jpeg,png}": ["@parcel/optimizer-image"]
   },
@@ -66,6 +75,7 @@
     "*.svg": "@parcel/packager-svg",
     "*.{xml,rss,atom}": "@parcel/packager-xml",
     "*.ts": "@parcel/packager-ts",
+    "*.wasm": "@parcel/packager-wasm",
     "*.{jsonld,svg,webmanifest}": "@parcel/packager-raw-url",
     "*": "@parcel/packager-raw"
   },

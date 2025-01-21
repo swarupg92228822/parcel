@@ -11,16 +11,16 @@ import _ncp from 'ncp';
 import {promisify} from 'util';
 import commandExists from 'command-exists';
 // flowlint-next-line untyped-import:off
-import _spawn from '@npmcli/promise-spawn';
-import _rimraf from 'rimraf';
+import spawn from 'cross-spawn';
+import rimraf from 'rimraf';
 import tempy from 'tempy';
 import chalk from 'chalk';
 import * as emoji from './emoji';
+import type {ChildProcess} from 'child_process';
 
 const TEMPLATES_DIR = path.resolve(__dirname, '../templates');
 
 const ncp = promisify(_ncp);
-const rimraf = promisify(_rimraf);
 // eslint-disable-next-line no-console
 const log = console.log;
 
@@ -142,32 +142,44 @@ async function installPackages(
   }
 
   if (usesYarn) {
-    return spawn(
-      'yarn',
-      [
-        'add',
-        opts.isDevDependency ? '--dev' : null,
-        ...packageExpressions,
-      ].filter(Boolean),
-      opts.cwd,
+    return promiseFromProcess(
+      spawn(
+        'yarn',
+        [
+          'add',
+          opts.isDevDependency ? '--dev' : null,
+          ...packageExpressions,
+        ].filter(Boolean),
+        {cwd: opts.cwd},
+      ),
     );
   }
 
-  return spawn(
-    'npm',
-    [
-      'install',
-      opts.isDevDependency ? '--save-dev' : null,
-      ...packageExpressions,
-    ].filter(Boolean),
-    opts.cwd,
+  return promiseFromProcess(
+    spawn(
+      'npm',
+      [
+        'install',
+        opts.isDevDependency ? '--save-dev' : null,
+        ...packageExpressions,
+      ].filter(Boolean),
+      {cwd: opts.cwd},
+    ),
   );
 }
 
-function spawn(command: string, args: Array<mixed>, cwd: string) {
-  return _spawn(command, args, {
-    cwd,
-    shell: process.platform === 'win32',
-    stdio: 'inherit',
+export default function promiseFromProcess(
+  childProcess: ChildProcess,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    childProcess.on('error', reject);
+    childProcess.on('close', code => {
+      if (code !== 0) {
+        reject(new Error('Child process failed'));
+        return;
+      }
+
+      resolve();
+    });
   });
 }

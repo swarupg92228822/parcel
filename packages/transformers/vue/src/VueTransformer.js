@@ -6,6 +6,7 @@ import nullthrows from 'nullthrows';
 import {hashObject} from '@parcel/utils';
 import ThrowableDiagnostic, {
   type Diagnostic,
+  convertSourceLocationToHighlight,
   escapeMarkdown,
   md,
 } from '@parcel/diagnostic';
@@ -15,7 +16,7 @@ import {basename, extname, relative, dirname} from 'path';
 // $FlowFixMe
 import * as compiler from '@vue/compiler-sfc';
 // $FlowFixMe
-import consolidate from 'consolidate';
+import consolidate from '@ladjs/consolidate';
 
 const MODULE_BY_NAME_RE = /\.module\./;
 
@@ -23,7 +24,16 @@ const MODULE_BY_NAME_RE = /\.module\./;
 export default (new Transformer({
   async loadConfig({config}) {
     let conf = await config.getConfig(
-      ['.vuerc', '.vuerc.json', '.vuerc.js', 'vue.config.js'],
+      [
+        '.vuerc',
+        '.vuerc.json',
+        '.vuerc.js',
+        '.vuerc.cjs',
+        '.vuerc.mjs',
+        'vue.config.js',
+        'vue.config.cjs',
+        'vue.config.mjs',
+      ],
       {packageKey: 'vue'},
     );
     let contents = {};
@@ -177,25 +187,15 @@ function createDiagnostic(err, filePath) {
     origin: '@parcel/transformer-vue',
     name: err.name,
     stack: err.stack,
-  };
-  if (err.loc) {
-    diagnostic.codeFrames = [
-      {
-        codeHighlights: [
+    codeFrames: err.loc
+      ? [
           {
-            start: {
-              line: err.loc.start.line + err.loc.start.offset,
-              column: err.loc.start.column,
-            },
-            end: {
-              line: err.loc.end.line + err.loc.end.offset,
-              column: err.loc.end.column,
-            },
+            filePath,
+            codeHighlights: [convertSourceLocationToHighlight(err.loc)],
           },
-        ],
-      },
-    ];
-  }
+        ]
+      : [],
+  };
   return diagnostic;
 }
 

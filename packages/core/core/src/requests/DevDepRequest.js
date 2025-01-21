@@ -1,12 +1,16 @@
 // @flow
-import type {DependencySpecifier} from '@parcel/types';
+import type {
+  DependencySpecifier,
+  SemverRange,
+  Invalidations,
+} from '@parcel/types';
 import type ParcelConfig from '../ParcelConfig';
 import type {
   DevDepRequest,
   ParcelOptions,
   InternalDevDepOptions,
 } from '../types';
-import type {RunAPI} from '../RequestTracker';
+import type {RequestResult, RunAPI} from '../RequestTracker';
 import type {ProjectPath} from '../projectPath';
 
 import nullthrows from 'nullthrows';
@@ -18,12 +22,13 @@ import {
   fromProjectPathRelative,
   toProjectPath,
 } from '../projectPath';
+import {requestTypes} from '../RequestTracker';
 
 // A cache of dev dep requests keyed by invalidations.
 // If the package manager returns the same invalidation object, then
 // we can reuse the dev dep request rather than recomputing the project
 // paths and hashes.
-const devDepRequestCache = new WeakMap();
+const devDepRequestCache: WeakMap<Invalidations, DevDepRequest> = new WeakMap();
 
 export async function createDevDependency(
   opts: InternalDevDepOptions,
@@ -48,7 +53,12 @@ export async function createDevDependency(
   let resolveFromAbsolute = fromProjectPath(options.projectRoot, resolveFrom);
 
   // Ensure that the package manager has an entry for this resolution.
-  await options.packageManager.resolve(specifier, resolveFromAbsolute);
+  try {
+    await options.packageManager.resolve(specifier, resolveFromAbsolute);
+  } catch (err) {
+    // ignore
+  }
+
   let invalidations = options.packageManager.getInvalidations(
     specifier,
     resolveFromAbsolute,
@@ -83,6 +93,7 @@ export async function createDevDependency(
       invalidateOnFileCreateToInternal(options.projectRoot, i),
     ),
     invalidateOnFileChange: new Set(invalidateOnFileChangeProject),
+    invalidateOnStartup: invalidations.invalidateOnStartup,
     additionalInvalidations,
   };
 
@@ -100,15 +111,17 @@ type DevDepRequests = {|
   invalidDevDeps: Array<DevDepSpecifier>,
 |};
 
-export async function getDevDepRequests(api: RunAPI): Promise<DevDepRequests> {
-  let previousDevDepRequests = new Map(
+export async function getDevDepRequests<TResult: RequestResult>(
+  api: RunAPI<TResult>,
+): Promise<DevDepRequests> {
+  let previousDevDepRequests: Map<string, DevDepRequestResult> = new Map(
     await Promise.all(
       api
         .getSubRequests()
-        .filter(req => req.type === 'dev_dep_request')
+        .filter(req => req.requestType === requestTypes.dev_dep_request)
         .map(async req => [
           req.id,
-          nullthrows(await api.getRequestResult<DevDepRequest>(req.id)),
+          nullthrows(await api.getRequestResult<DevDepRequestResult>(req.id)),
         ]),
     ),
   );
@@ -117,7 +130,7 @@ export async function getDevDepRequests(api: RunAPI): Promise<DevDepRequests> {
     devDeps: new Map(
       [...previousDevDepRequests.entries()]
         .filter(([id]) => api.canSkipSubrequest(id))
-        .map(([, req]) => [
+        .map(([, req]: [string, DevDepRequestResult]) => [
           `${req.specifier}:${fromProjectPathRelative(req.resolveFrom)}`,
           req.hash,
         ]),
@@ -125,7 +138,7 @@ export async function getDevDepRequests(api: RunAPI): Promise<DevDepRequests> {
     invalidDevDeps: await Promise.all(
       [...previousDevDepRequests.entries()]
         .filter(([id]) => !api.canSkipSubrequest(id))
-        .flatMap(([, req]) => {
+        .flatMap(([, req]: [string, DevDepRequestResult]) => {
           return [
             {
               specifier: req.specifier,
@@ -163,23 +176,42 @@ export function invalidateDevDeps(
   }
 }
 
-export async function runDevDepRequest(
-  api: RunAPI,
+export type DevDepRequestResult = {|
+  specifier: DependencySpecifier,
+  resolveFrom: ProjectPath,
+  hash: string,
+  additionalInvalidations: void | Array<{|
+    range?: ?SemverRange,
+    resolveFrom: ProjectPath,
+    specifier: DependencySpecifier,
+  |}>,
+|};
+
+export async function runDevDepRequest<TResult: RequestResult>(
+  api: RunAPI<TResult>,
   devDepRequest: DevDepRequest,
 ) {
-  await api.runRequest<null, void>({
+  await api.runRequest<null, DevDepRequestResult | void>({
     id: 'dev_dep_request:' + devDepRequest.specifier + ':' + devDepRequest.hash,
-    type: 'dev_dep_request',
+    type: requestTypes.dev_dep_request,
     run: ({api}) => {
-      for (let filePath of nullthrows(devDepRequest.invalidateOnFileChange)) {
+      for (let filePath of nullthrows(
+        devDepRequest.invalidateOnFileChange,
+        'DevDepRequest missing invalidateOnFileChange',
+      )) {
         api.invalidateOnFileUpdate(filePath);
         api.invalidateOnFileDelete(filePath);
       }
 
       for (let invalidation of nullthrows(
         devDepRequest.invalidateOnFileCreate,
+        'DevDepRequest missing invalidateOnFileCreate',
       )) {
         api.invalidateOnFileCreate(invalidation);
+      }
+
+      if (devDepRequest.invalidateOnStartup) {
+        api.invalidateOnStartup();
       }
 
       api.storeResult({

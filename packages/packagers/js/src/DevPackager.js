@@ -6,12 +6,14 @@ import {
   relativeBundlePath,
   countLines,
   normalizeSeparators,
+  relativePath,
 } from '@parcel/utils';
 import SourceMap from '@parcel/source-map';
 import invariant from 'assert';
 import path from 'path';
 import fs from 'fs';
 import {replaceScriptDependencies, getSpecifier} from './utils';
+import {helpers} from './helpers';
 
 const PRELUDE = fs
   .readFileSync(path.join(__dirname, 'dev-prelude.js'), 'utf8')
@@ -39,16 +41,14 @@ export class DevPackager {
   async package(): Promise<{|contents: string, map: ?SourceMap|}> {
     // Load assets
     let queue = new PromiseQueue({maxConcurrent: 32});
-    this.bundle.traverse(node => {
-      if (node.type === 'asset') {
-        queue.add(async () => {
-          let [code, mapBuffer] = await Promise.all([
-            node.value.getCode(),
-            this.bundle.env.sourceMap && node.value.getMapBuffer(),
-          ]);
-          return {code, mapBuffer};
-        });
-      }
+    this.bundle.traverseAssets(asset => {
+      queue.add(async () => {
+        let [code, mapBuffer] = await Promise.all([
+          asset.getCode(),
+          this.bundle.env.sourceMap && asset.getMapBuffer(),
+        ]);
+        return {code, mapBuffer};
+      });
     });
 
     let results = await queue.run();
@@ -62,6 +62,7 @@ export class DevPackager {
     let lineOffset = countLines(prefix);
     let script: ?{|code: string, mapBuffer: ?Buffer|} = null;
 
+    let usedHelpers = 0;
     this.bundle.traverse(node => {
       let wrapped = first ? '' : ',';
 
@@ -89,6 +90,10 @@ export class DevPackager {
           'all assets in a js bundle must be js assets',
         );
 
+        if (typeof asset.meta.usedHelpers === 'number') {
+          usedHelpers |= asset.meta.usedHelpers;
+        }
+
         // If this is the main entry of a script rather than a module, we need to hoist it
         // outside the bundle wrapper function so that its variables are exposed as globals.
         if (
@@ -103,11 +108,24 @@ export class DevPackager {
         let dependencies = this.bundleGraph.getDependencies(asset);
         for (let dep of dependencies) {
           let resolved = this.bundleGraph.getResolvedAsset(dep, this.bundle);
+          let specifier = getSpecifier(dep);
           if (this.bundleGraph.isDependencySkipped(dep)) {
-            deps[getSpecifier(dep)] = false;
+            deps[specifier] = false;
           } else if (resolved) {
-            deps[getSpecifier(dep)] =
-              this.bundleGraph.getAssetPublicId(resolved);
+            deps[specifier] = this.bundleGraph.getAssetPublicId(resolved);
+          } else {
+            // An external module - map placeholder to original specifier.
+            deps[specifier] = dep.specifier;
+          }
+        }
+
+        // Add dependencies for parcelRequire calls added by runtimes
+        // so that the HMR runtime can correctly traverse parents.
+        let hmrDeps = asset.meta.hmrDeps;
+        if (this.options.hmrOptions && Array.isArray(hmrDeps)) {
+          for (let id of hmrDeps) {
+            invariant(typeof id === 'string');
+            deps[id] = id;
           }
         }
 
@@ -115,7 +133,7 @@ export class DevPackager {
         let output = code || '';
         wrapped +=
           JSON.stringify(this.bundleGraph.getAssetPublicId(asset)) +
-          ':[function(require,module,exports) {\n' +
+          ':[function(require,module,exports,__globalThis) {\n' +
           output +
           '\n},';
         wrapped += JSON.stringify(deps);
@@ -160,13 +178,34 @@ export class DevPackager {
     let entries = this.bundle.getEntryAssets();
     let mainEntry = this.bundle.getMainEntry();
     if (
-      (!this.isEntry() && this.bundle.env.outputFormat === 'global') ||
+      (!this.isEntry() && this.bundle.env.outputFormat !== 'commonjs') ||
       this.bundle.env.sourceType === 'script'
     ) {
       // In async bundles we don't want the main entry to execute until we require it
       // as there might be dependencies in a sibling bundle that hasn't loaded yet.
       entries = entries.filter(a => a.id !== mainEntry?.id);
       mainEntry = null;
+    }
+
+    let load = '';
+    if (usedHelpers & 4) {
+      load += helpers.$parcel$import(this.bundle.env, this.bundle, new Set());
+      load += 'newRequire.load = $parcel$import;\n';
+    }
+
+    if (usedHelpers & 8) {
+      load += helpers.$parcel$resolve(this.bundle.env, this.bundle, new Set());
+      load += 'newRequire.resolve = $parcel$resolve;\n';
+    }
+
+    if (usedHelpers & 16) {
+      load += helpers.$parcel$extendImportMap(this.bundle.env);
+      load += `newRequire.extendImportMap = $parcel$extendImportMap;\n`;
+    }
+
+    if (load) {
+      usedHelpers |= 1 | 2;
+      prefix = prefix.replace('// INSERT_LOAD_HERE', load);
     }
 
     let contents =
@@ -182,9 +221,29 @@ export class DevPackager {
         mainEntry ? this.bundleGraph.getAssetPublicId(mainEntry) : null,
       ) +
       ', ' +
-      JSON.stringify(this.parcelRequireName) +
-      ')' +
-      '\n';
+      JSON.stringify(this.parcelRequireName);
+
+    if (usedHelpers & 1) {
+      // Generate a relative path from this bundle to the root of the dist dir.
+      let distDir = relativePath(path.dirname(this.bundle.name), '');
+      if (!distDir.endsWith('/')) {
+        distDir += '/';
+      }
+      contents += ', ' + JSON.stringify(distDir);
+    } else if (usedHelpers & 2) {
+      contents += ', null';
+    }
+
+    if (usedHelpers & 2) {
+      // Ensure the public url always ends with a slash to code can easily join paths to it.
+      let publicUrl = this.bundle.target.publicUrl;
+      if (!publicUrl.endsWith('/')) {
+        publicUrl += '/';
+      }
+      contents += ', ' + JSON.stringify(publicUrl);
+    }
+
+    contents += ')\n';
 
     // The entry asset of a script bundle gets hoisted outside the bundle wrapper function
     // so that its variables become globals. We need to replace any require calls for
@@ -230,6 +289,23 @@ export class DevPackager {
           this.bundle,
           b,
         )}");\n`;
+      }
+    } else if (this.bundle.env.isNode()) {
+      let bundles = this.bundleGraph.getReferencedBundles(this.bundle, {
+        includeInline: false,
+      });
+      for (let b of bundles) {
+        if (b.type !== 'js') {
+          continue;
+        }
+        if (this.bundle.env.outputFormat === 'esmodule') {
+          importScripts += `import "${relativeBundlePath(this.bundle, b)}";\n`;
+        } else {
+          importScripts += `require("${relativeBundlePath(
+            this.bundle,
+            b,
+          )}");\n`;
+        }
       }
     }
 

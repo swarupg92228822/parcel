@@ -14,7 +14,7 @@ describe('glob', function () {
   it('should require a glob of files', async function () {
     let b = await bundle(path.join(__dirname, '/integration/glob/index.js'));
 
-    await assertBundles(b, [
+    assertBundles(b, [
       {
         name: 'index.js',
         assets: ['index.js', '*.js', 'a.js', 'b.js'],
@@ -31,7 +31,7 @@ describe('glob', function () {
       path.join(__dirname, '/integration/glob-deep/index.js'),
     );
 
-    await assertBundles(b, [
+    assertBundles(b, [
       {
         name: 'index.js',
         assets: ['index.js', '*.js', 'a.js', 'b.js', 'c.js', 'z.js'],
@@ -48,7 +48,7 @@ describe('glob', function () {
       path.join(__dirname, '/integration/glob-css/index.js'),
     );
 
-    await assertBundles(b, [
+    assertBundles(b, [
       {
         name: 'index.js',
         assets: ['index.js'],
@@ -77,10 +77,10 @@ describe('glob', function () {
       path.join(__dirname, '/integration/glob-pipeline/index.js'),
     );
 
-    await assertBundles(b, [
+    assertBundles(b, [
       {
         name: 'index.js',
-        assets: ['index.js', '*.js', 'bundle-url.js'],
+        assets: ['index.js', '*.js'],
       },
       {
         type: 'txt',
@@ -108,16 +108,10 @@ describe('glob', function () {
       path.join(__dirname, '/integration/glob-async/index.js'),
     );
 
-    await assertBundles(b, [
+    assertBundles(b, [
       {
         name: 'index.js',
-        assets: [
-          'index.js',
-          '*.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'js-loader.js',
-        ],
+        assets: ['index.js', '*.js', 'cacheLoader.js', 'js-loader.js'],
       },
       {
         type: 'js',
@@ -135,7 +129,7 @@ describe('glob', function () {
 
   it('should error when an unsupported asset type imports a glob', async function () {
     let filePath = path.join(__dirname, '/integration/glob-error/index.html');
-    // $FlowFixMe
+    // $FlowFixMe[prop-missing]
     await assert.rejects(() => bundle(filePath), {
       name: 'BuildError',
       diagnostics: [
@@ -154,7 +148,7 @@ describe('glob', function () {
 
   it('should error when a URL dependency imports a glob', async function () {
     let filePath = path.join(__dirname, '/integration/glob-error/index.css');
-    // $FlowFixMe
+    // $FlowFixMe[prop-missing]
     await assert.rejects(() => bundle(filePath), {
       name: 'BuildError',
       diagnostics: [
@@ -167,6 +161,7 @@ describe('glob', function () {
               code: await inputFS.readFile(filePath, 'utf8'),
               codeHighlights: [
                 {
+                  message: undefined,
                   start: {
                     column: 19,
                     line: 2,
@@ -187,6 +182,7 @@ describe('glob', function () {
             {
               codeHighlights: [
                 {
+                  message: undefined,
                   start: {
                     column: 19,
                     line: 2,
@@ -208,7 +204,7 @@ describe('glob', function () {
     let b = await bundle(
       path.join(__dirname, '/integration/glob-package/index.js'),
     );
-    await assertBundles(b, [
+    assertBundles(b, [
       {
         name: 'index.js',
         assets: ['*.js', '*.js', 'a.js', 'b.js', 'x.js', 'y.js', 'index.js'],
@@ -224,17 +220,10 @@ describe('glob', function () {
     let b = await bundle(
       path.join(__dirname, '/integration/glob-package-async/index.js'),
     );
-    await assertBundles(b, [
+    assertBundles(b, [
       {
         name: 'index.js',
-        assets: [
-          '*.js',
-          '*.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'index.js',
-          'js-loader.js',
-        ],
+        assets: ['*.js', '*.js', 'cacheLoader.js', 'index.js', 'js-loader.js'],
       },
       {type: 'js', assets: ['a.js']},
       {type: 'js', assets: ['b.js']},
@@ -245,5 +234,36 @@ describe('glob', function () {
     let output = await run(b);
     assert.equal(typeof output, 'function');
     assert.equal(await output(), 10);
+  });
+
+  it('should resolve a glob with ~', async function () {
+    let b = await bundle(
+      path.join(__dirname, '/integration/glob-tilde/packages/child/index.js'),
+    );
+    assertBundles(b, [
+      {
+        name: 'index.js',
+        assets: ['index.js', '*.js', 'a.js', 'b.js'],
+      },
+    ]);
+    let output = await run(b);
+    assert.equal(output, 3);
+  });
+
+  it('should resolve an absolute glob', async function () {
+    let b = await bundle(
+      path.join(
+        __dirname,
+        '/integration/glob-absolute/packages/child/index.js',
+      ),
+    );
+    assertBundles(b, [
+      {
+        name: 'index.js',
+        assets: ['index.js', '*.js', 'a.js', 'b.js'],
+      },
+    ]);
+    let output = await run(b);
+    assert.equal(output, 3);
   });
 });

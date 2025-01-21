@@ -5,21 +5,22 @@ import {Optimizer} from '@parcel/plugin';
 import postcss from 'postcss';
 import cssnano from 'cssnano';
 import type {CSSNanoOptions} from 'cssnano'; // TODO the type is based on cssnano 4
-import path from 'path';
 
 export default (new Optimizer({
   async loadConfig({config}) {
     const configFile = await config.getConfig(
-      ['.cssnanorc', 'cssnano.config.json', 'cssnano.config.js'],
+      [
+        '.cssnanorc',
+        'cssnano.config.json',
+        'cssnano.config.js',
+        'cssnano.config.cjs',
+        'cssnano.config.mjs',
+      ],
       {
         packageKey: 'cssnano',
       },
     );
     if (configFile) {
-      let isJavascript = path.extname(configFile.filePath) === '.js';
-      if (isJavascript) {
-        config.invalidateOnStartup();
-      }
       return configFile.contents;
     }
   },

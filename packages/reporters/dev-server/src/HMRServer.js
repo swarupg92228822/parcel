@@ -1,21 +1,33 @@
 // @flow
-
 import type {
-  BuildSuccessEvent,
-  Dependency,
-  PluginOptions,
-  BundleGraph,
-  PackagedBundle,
   Asset,
+  BundleGraph,
+  Dependency,
+  NamedBundle,
+  PackagedBundle,
+  PluginOptions,
 } from '@parcel/types';
 import type {Diagnostic} from '@parcel/diagnostic';
 import type {AnsiDiagnosticResult} from '@parcel/utils';
-import type {ServerError, HMRServerOptions} from './types.js.flow';
+import type {
+  ServerError,
+  HMRServerOptions,
+  Request,
+  Response,
+} from './types.js.flow';
+import {setHeaders, SOURCES_ENDPOINT} from './Server';
 
+import nullthrows from 'nullthrows';
+import url from 'url';
+import mime from 'mime-types';
 import WebSocket from 'ws';
 import invariant from 'assert';
-import {ansiHtml, prettyDiagnostic, PromiseQueue} from '@parcel/utils';
-import {HMR_ENDPOINT} from './Server';
+import {
+  ansiHtml,
+  createHTTPServer,
+  prettyDiagnostic,
+  PromiseQueue,
+} from '@parcel/utils';
 
 export type HMRAsset = {|
   id: string,
@@ -23,6 +35,7 @@ export type HMRAsset = {|
   type: string,
   output: string,
   envHash: string,
+  outputFormat: string,
   depsByBundle: {[string]: {[string]: string, ...}, ...},
 |};
 
@@ -30,6 +43,9 @@ export type HMRMessage =
   | {|
       type: 'update',
       assets: Array<HMRAsset>,
+    |}
+  | {|
+      type: 'reload',
     |}
   | {|
       type: 'error',
@@ -40,22 +56,44 @@ export type HMRMessage =
     |};
 
 const FS_CONCURRENCY = 64;
+const HMR_ENDPOINT = '/__parcel_hmr';
+const BROADCAST_MAX_ASSETS = 10000;
 
 export default class HMRServer {
   wss: WebSocket.Server;
   unresolvedError: HMRMessage | null = null;
   options: HMRServerOptions;
+  bundleGraph: BundleGraph<PackagedBundle> | BundleGraph<NamedBundle> | null =
+    null;
+  stopServer: ?() => Promise<void>;
 
   constructor(options: HMRServerOptions) {
     this.options = options;
   }
 
-  start(): any {
-    this.wss = new WebSocket.Server(
-      this.options.devServer
-        ? {server: this.options.devServer}
-        : {port: this.options.port},
-    );
+  async start() {
+    let server = this.options.devServer;
+    if (!server) {
+      let result = await createHTTPServer({
+        https: this.options.https,
+        inputFS: this.options.inputFS,
+        outputFS: this.options.outputFS,
+        cacheDir: this.options.cacheDir,
+        listener: (req, res) => {
+          setHeaders(res);
+          if (!this.handle(req, res)) {
+            res.statusCode = 404;
+            res.end();
+          }
+        },
+      });
+      server = result.server;
+      server.listen(this.options.port, this.options.host);
+      this.stopServer = result.stop;
+    } else {
+      this.options.addMiddleware?.((req, res) => this.handle(req, res));
+    }
+    this.wss = new WebSocket.Server({server});
 
     this.wss.on('connection', ws => {
       if (this.unresolvedError) {
@@ -65,14 +103,32 @@ export default class HMRServer {
 
     // $FlowFixMe[incompatible-exact]
     this.wss.on('error', err => this.handleSocketError(err));
-
-    let address = this.wss.address();
-    invariant(typeof address === 'object' && address != null);
-    return address.port;
   }
 
-  stop() {
+  handle(req: Request, res: Response): boolean {
+    let {pathname} = url.parse(req.originalUrl || req.url);
+    if (pathname != null && pathname.startsWith(HMR_ENDPOINT)) {
+      let id = pathname.slice(HMR_ENDPOINT.length + 1);
+      let bundleGraph = nullthrows(this.bundleGraph);
+      let asset = bundleGraph.getAssetById(id);
+      this.getHotAssetContents(asset).then(output => {
+        res.setHeader('Content-Type', mime.contentType(asset.type));
+        res.end(output);
+      });
+      return true;
+    }
+    return false;
+  }
+
+  async stop() {
+    if (this.stopServer != null) {
+      await this.stopServer();
+      this.stopServer = null;
+    }
     this.wss.close();
+    for (const ws of this.wss.clients) {
+      ws.terminate();
+    }
   }
 
   async emitError(options: PluginOptions, diagnostics: Array<Diagnostic>) {
@@ -104,11 +160,16 @@ export default class HMRServer {
     this.broadcast(this.unresolvedError);
   }
 
-  async emitUpdate(event: BuildSuccessEvent) {
+  async getUpdate(event: {
+    +bundleGraph: BundleGraph<PackagedBundle> | BundleGraph<NamedBundle>,
+    +changedAssets: Map<string, Asset>,
+    ...
+  }): Promise<?HMRMessage> {
     this.unresolvedError = null;
+    this.bundleGraph = event.bundleGraph;
 
     let changedAssets = new Set(event.changedAssets.values());
-    if (changedAssets.size === 0) return;
+    if (changedAssets.size === 0) return Promise.resolve(null);
 
     let queue = new PromiseQueue({maxConcurrent: FS_CONCURRENCY});
     for (let asset of changedAssets) {
@@ -153,24 +214,69 @@ export default class HMRServer {
 
         return {
           id: event.bundleGraph.getAssetPublicId(asset),
-          url: getSourceURL(event.bundleGraph, asset),
+          url: this.getSourceURL(asset),
           type: asset.type,
           // No need to send the contents of non-JS assets to the client.
           output:
-            asset.type === 'js'
-              ? await getHotAssetContents(event.bundleGraph, asset)
-              : '',
+            asset.type === 'js' ? await this.getHotAssetContents(asset) : '',
           envHash: asset.env.id,
+          outputFormat: asset.env.outputFormat,
           depsByBundle,
         };
       });
     }
 
     let assets = await queue.run();
-    this.broadcast({
-      type: 'update',
-      assets: assets,
-    });
+    if (assets.length >= BROADCAST_MAX_ASSETS) {
+      // Too many assets to send via an update without errors, just reload instead
+      return {type: 'reload'};
+    } else if (assets.length > 0) {
+      return {
+        type: 'update',
+        assets,
+      };
+    }
+  }
+
+  async getHotAssetContents(asset: Asset): Promise<string> {
+    let output = await asset.getCode();
+    let bundleGraph = nullthrows(this.bundleGraph);
+    if (asset.type === 'js') {
+      let publicId = bundleGraph.getAssetPublicId(asset);
+      output = `parcelHotUpdate['${publicId}'] = function (require, module, exports) {${output}}`;
+    }
+
+    let sourcemap = await asset.getMap();
+    if (sourcemap) {
+      let sourcemapStringified = await sourcemap.stringify({
+        format: 'inline',
+        sourceRoot:
+          (asset.env.isNode() ? this.options.projectRoot : SOURCES_ENDPOINT) +
+          '/',
+        // $FlowFixMe
+        fs: asset.fs,
+      });
+
+      invariant(typeof sourcemapStringified === 'string');
+      output += `\n//# sourceMappingURL=${sourcemapStringified}`;
+      output += `\n//# sourceURL=${encodeURI(this.getSourceURL(asset))}\n`;
+    }
+
+    return output;
+  }
+
+  getSourceURL(asset: Asset): string {
+    let origin = '';
+    if (
+      !this.options.devServer ||
+      // $FlowFixMe
+      this.bundleGraph?.getEntryBundles().some(b => b.env.isServer())
+    ) {
+      origin = `http://${this.options.host || 'localhost'}:${
+        this.options.port
+      }`;
+    }
+    return origin + HMR_ENDPOINT + '/' + asset.id;
   }
 
   handleSocketError(err: ServerError) {
@@ -200,35 +306,4 @@ function getSpecifier(dep: Dependency): string {
   }
 
   return dep.specifier;
-}
-
-export async function getHotAssetContents(
-  bundleGraph: BundleGraph<PackagedBundle>,
-  asset: Asset,
-): Promise<string> {
-  let output = await asset.getCode();
-  if (asset.type === 'js') {
-    let publicId = bundleGraph.getAssetPublicId(asset);
-    output = `parcelHotUpdate['${publicId}'] = function (require, module, exports) {${output}}`;
-  }
-
-  let sourcemap = await asset.getMap();
-  if (sourcemap) {
-    let sourcemapStringified = await sourcemap.stringify({
-      format: 'inline',
-      sourceRoot: '/__parcel_source_root/',
-      // $FlowFixMe
-      fs: asset.fs,
-    });
-
-    invariant(typeof sourcemapStringified === 'string');
-    output += `\n//# sourceMappingURL=${sourcemapStringified}`;
-    output += `\n//# sourceURL=${getSourceURL(bundleGraph, asset)}\n`;
-  }
-
-  return output;
-}
-
-function getSourceURL(bundleGraph, asset) {
-  return HMR_ENDPOINT + asset.id;
 }

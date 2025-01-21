@@ -9,7 +9,9 @@ import {
 } from '@parcel/utils';
 import path from 'path';
 import nullthrows from 'nullthrows';
-import ThrowableDiagnostic from '@parcel/diagnostic';
+import ThrowableDiagnostic, {
+  convertSourceLocationToHighlight,
+} from '@parcel/diagnostic';
 import NodeResolver from '@parcel/node-resolver-core';
 import invariant from 'assert';
 
@@ -21,10 +23,7 @@ function errorToThrowableDiagnostic(error, dependency): ThrowableDiagnostic {
         ? [
             {
               codeHighlights: [
-                {
-                  start: dependency.loc.start,
-                  end: dependency.loc.end,
-                },
+                convertSourceLocationToHighlight(dependency.loc),
               ],
             },
           ]
@@ -58,60 +57,108 @@ export default (new Resolver({
       throw errorToThrowableDiagnostic(error, dependency);
     }
 
-    // if the specifier does not start with /, ~, or . then it's not a path but package-ish - we resolve
-    // the package first, and then append the rest of the path
-    if (!/^[/~.]/.test(specifier)) {
-      // Globs are not paths - so they always use / (see https://github.com/micromatch/micromatch#backslashes)
-      let splitOn = specifier.indexOf('/');
-      if (specifier.charAt(0) === '@') {
-        splitOn = specifier.indexOf('/', splitOn + 1);
+    let invalidateOnFileCreate = [];
+    let invalidateOnFileChange = new Set();
+
+    switch (specifier[0]) {
+      // Path specifier
+      case '.': {
+        specifier = path.resolve(path.dirname(sourceFile), specifier);
+        break;
       }
 
-      // Since we've already asserted earlier that there is a glob present, it shouldn't be
-      // possible for there to be only a package here without any other path parts (e.g. `import('pkg')`)
-      invariant(splitOn !== -1);
+      // Absolute path. Make the glob relative to the project root.
+      case '/': {
+        specifier = path.resolve(options.projectRoot, specifier.slice(1));
+        break;
+      }
 
-      let pkg = specifier.substring(0, splitOn);
-      let rest = specifier.substring(splitOn + 1);
-
-      // This initialisation code is copied from the DefaultResolver
-      const resolver = new NodeResolver({
-        fs: options.inputFS,
-        projectRoot: options.projectRoot,
-        // Extensions are always required in URL dependencies.
-        extensions:
-          dependency.specifierType === 'commonjs' ||
-          dependency.specifierType === 'esm'
-            ? ['ts', 'tsx', 'js', 'jsx', 'json']
-            : [],
-        mainFields: ['source', 'browser', 'module', 'main'],
-        packageManager: options.shouldAutoInstall
-          ? options.packageManager
-          : undefined,
-        logger,
-      });
-
-      const result = await resolver.resolve({
-        filename: pkg,
-        specifierType: dependency.specifierType,
-        parent: dependency.resolveFrom,
-        env: dependency.env,
-        sourcePath: dependency.sourcePath,
-        loc: dependency.loc,
-      });
-
-      if (!result || !result.filePath) {
-        throw errorToThrowableDiagnostic(
-          `Unable to resolve ${pkg} from ${sourceFile} when evaluating specifier ${specifier}`,
-          dependency,
+      // Tilde path. Package relative. Resolve relative to nearest node_modules
+      // directory, the nearest directory with package.json or the project
+      // root - whichever comes first.
+      case '~': {
+        let dir = path.dirname(sourceFile);
+        let pkgPath = nullthrows(
+          options.inputFS.findAncestorFile(
+            ['package.json'],
+            dir,
+            options.projectRoot,
+          ),
         );
-      } else if (result.diagnostics) {
-        throw new ThrowableDiagnostic({diagnostic: result.diagnostics});
+        specifier = path.resolve(path.dirname(pkgPath), specifier.slice(2));
+        break;
       }
 
-      specifier = path.resolve(path.dirname(result.filePath), rest);
-    } else {
-      specifier = path.resolve(path.dirname(sourceFile), specifier);
+      // Support package-ish specifiers like:
+      //   foo      (node_module)
+      //   @foo/bar (scoped node_module)
+      //
+      // First we resolve the initial portion using NodeResolver, then we tack
+      // on the remaining glob.
+      default: {
+        // Globs are not paths - so they always use / (see https://github.com/micromatch/micromatch#backslashes)
+        let splitOn = specifier.indexOf('/');
+        if (specifier[0] === '@') {
+          splitOn = specifier.indexOf('/', splitOn + 1);
+        }
+
+        // Since we've already asserted earlier that there is a glob present, it shouldn't be
+        // possible for there to be only a package here without any other path parts (e.g. `import('pkg')`)
+        invariant(splitOn !== -1);
+
+        let pkg = specifier.substring(0, splitOn);
+        let rest = specifier.substring(splitOn + 1);
+
+        // This initialisation code is copied from the DefaultResolver
+        const resolver = new NodeResolver({
+          fs: options.inputFS,
+          projectRoot: options.projectRoot,
+          packageManager: options.shouldAutoInstall
+            ? options.packageManager
+            : undefined,
+          mode: options.mode,
+          logger,
+        });
+
+        let result;
+        try {
+          result = await resolver.resolve({
+            filename: pkg + '/package.json',
+            parent: dependency.resolveFrom,
+            specifierType: 'esm',
+            env: dependency.env,
+            sourcePath: dependency.sourcePath,
+          });
+        } catch (err) {
+          if (err instanceof ThrowableDiagnostic) {
+            // Return instead of throwing so we can provide invalidations.
+            return {
+              diagnostics: err.diagnostics,
+              invalidateOnFileCreate,
+              invalidateOnFileChange: [...invalidateOnFileChange],
+            };
+          } else {
+            throw err;
+          }
+        }
+
+        if (!result || !result.filePath) {
+          throw errorToThrowableDiagnostic(
+            `Unable to resolve ${pkg} from ${sourceFile} when resolving specifier ${specifier}`,
+            dependency,
+          );
+        }
+
+        specifier = path.resolve(path.dirname(result.filePath), rest);
+        if (result.invalidateOnFileChange) {
+          for (let f of result.invalidateOnFileChange) {
+            invalidateOnFileChange.add(f);
+          }
+        }
+        if (result.invalidateOnFileCreate) {
+          invalidateOnFileCreate.push(...result.invalidateOnFileCreate);
+        }
+      }
     }
 
     let normalized = normalizeSeparators(specifier);
@@ -119,7 +166,7 @@ export default (new Resolver({
       onlyFiles: true,
     });
 
-    let dir = path.dirname(specifier);
+    let dir = path.dirname(sourceFile);
     let results = files.map(file => {
       let relative = relativePath(dir, file);
       if (pipeline) {
@@ -151,6 +198,8 @@ export default (new Resolver({
       }
     }
 
+    invalidateOnFileCreate.push({glob: normalized});
+
     return {
       filePath: path.join(
         dir,
@@ -159,7 +208,8 @@ export default (new Resolver({
           sourceAssetType,
       ),
       code,
-      invalidateOnFileCreate: [{glob: normalized}],
+      invalidateOnFileCreate,
+      invalidateOnFileChange: [...invalidateOnFileChange],
       pipeline: null,
       priority: 'sync',
     };

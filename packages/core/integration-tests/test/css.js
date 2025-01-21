@@ -22,17 +22,21 @@ describe('css', () => {
     assertBundles(b, [
       {
         name: 'index.js',
-        assets: ['index.js', 'local.js'],
+        assets: ['index.js', 'local.js', 'c.js'],
       },
       {
         name: 'index.css',
-        assets: ['index.css', 'local.css'],
+        assets: ['index.css', 'local.css', 'c.css'],
       },
     ]);
 
     let output = await run(b);
     assert.equal(typeof output, 'function');
     assert.equal(output(), 3);
+
+    let css = await outputFS.readFile(path.join(distDir, 'index.css'), 'utf8');
+    assert.ok(css.indexOf('.c {') < css.indexOf('.local {'));
+    assert.ok(css.indexOf('.local {') < css.indexOf('.index {'));
   });
 
   it('should bundle css dependencies in the correct, postorder traversal order', async () => {
@@ -64,7 +68,46 @@ describe('css', () => {
         css.indexOf('.e {') < css.indexOf('.a {'),
     );
   });
+  it('should place one css bundle per bundlegroup for naming reasons', async () => {
+    let b = await bundle(
+      path.join(__dirname, '/integration/multi-css-bug/src/entry.js'),
+    );
 
+    assertBundles(b, [
+      {
+        name: 'entry.js',
+        type: 'js',
+        assets: ['cacheLoader.js', 'entry.js', 'js-loader.js'],
+      },
+      {
+        type: 'js',
+        assets: ['esmodule-helpers.js', 'index.js'],
+      },
+      {name: 'entry.css', type: 'css', assets: ['foo.css', 'main.css']},
+    ]);
+  });
+  it.skip('create a new css bundle to maintain one css bundle per bundlegroup constraint', async () => {
+    let b = await bundle(
+      path.join(
+        __dirname,
+        '/integration/multi-css-multi-entry-bug/src/entry.js',
+      ),
+    );
+
+    assertBundles(b, [
+      {
+        name: 'entry.js',
+        type: 'js',
+        assets: ['cacheLoader.js', 'css-loader.js', 'entry.js', 'js-loader.js'],
+      },
+      {
+        type: 'js',
+        assets: ['esmodule-helpers.js', 'index.js'],
+      },
+      {name: 'Foo.css', type: 'css', assets: ['foo.css']},
+      {name: 'entry.css', type: 'css', assets: ['foo.css', 'main.css']},
+    ]);
+  });
   it('should support loading a CSS bundle along side dynamic imports', async () => {
     let b = await bundle(
       path.join(__dirname, '/integration/dynamic-css/index.js'),
@@ -73,13 +116,7 @@ describe('css', () => {
     assertBundles(b, [
       {
         name: 'index.js',
-        assets: [
-          'bundle-url.js',
-          'cacheLoader.js',
-          'css-loader.js',
-          'index.js',
-          'js-loader.js',
-        ],
+        assets: ['cacheLoader.js', 'css-loader.js', 'index.js', 'js-loader.js'],
       },
       {name: /local\.[0-9a-f]{8}\.js/, assets: ['local.js']},
       {name: /local\.[0-9a-f]{8}\.css/, assets: ['local.css']},
@@ -114,7 +151,9 @@ describe('css', () => {
     let css = await outputFS.readFile(path.join(distDir, '/index.css'), 'utf8');
     assert(css.includes('.local'));
     assert(css.includes('.other'));
-    assert(/@media print {\s*.other/.test(css));
+    assert(
+      /@media print {\s*\.local(.|\n)*\.other(.|\n)*}(.|\n)*\.index/.test(css),
+    );
     assert(css.includes('.index'));
   });
 
@@ -419,6 +458,7 @@ describe('css', () => {
                 code,
                 codeHighlights: [
                   {
+                    message: undefined,
                     start: {
                       line: 5,
                       column: 3,
@@ -455,6 +495,19 @@ describe('css', () => {
     ]);
   });
 
+  it('should support the style package exports condition', async () => {
+    let b = await bundle(
+      path.join(__dirname, '/integration/css-exports/index.css'),
+    );
+
+    assertBundles(b, [
+      {
+        name: 'index.css',
+        assets: ['index.css', 'foo.css'],
+      },
+    ]);
+  });
+
   it('should support external CSS imports', async () => {
     let b = await bundle(
       path.join(__dirname, '/integration/css-external/a.css'),
@@ -479,17 +532,32 @@ describe('css', () => {
     );
   });
 
-  it('should support css nesting with @parcel/css', async function () {
+  it('should support css nesting with lightningcss', async function () {
     let b = await bundle(
       path.join(__dirname, '/integration/css-nesting/a.css'),
       {
         defaultTargetOptions: {
-          engines: {},
+          engines: {
+            browsers: 'chrome 80',
+          },
         },
       },
     );
 
     let res = await outputFS.readFile(b.getBundles()[0].filePath, 'utf8');
     assert(res.includes('.foo.bar'));
+  });
+
+  it('should support @layer', async function () {
+    let b = await bundle(path.join(__dirname, '/integration/css-layer/a.css'), {
+      mode: 'production',
+    });
+
+    let res = await outputFS.readFile(b.getBundles()[0].filePath, 'utf8');
+    assert(
+      res.includes(
+        '@layer b.c{.c{color:#ff0}}@layer b{.b{color:#00f}}.a{color:red}',
+      ),
+    );
   });
 });

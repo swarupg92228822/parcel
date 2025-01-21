@@ -1,18 +1,21 @@
 import assert from 'assert';
 import {
+  assertBundles,
   bundle,
   bundler,
-  assertBundles,
-  removeDistDirectory,
   distDir,
   getNextBuild,
+  removeDistDirectory,
   run,
   inputFS,
   outputFS,
   overlayFS,
   ncp,
+  fsFixture,
 } from '@parcel/test-utils';
 import path from 'path';
+import Logger from '@parcel/logger';
+import {md} from '@parcel/diagnostic';
 
 describe('html', function () {
   beforeEach(async () => {
@@ -36,32 +39,40 @@ describe('html', function () {
         assets: ['index.html'],
       },
       {
+        // index.html
         name: 'index.html',
         assets: ['index.html'],
       },
       {
+        // foo/index.html
         name: 'index.html',
         assets: ['index.html'],
       },
       {
-        type: 'png',
-        assets: ['100x100.png'],
+        // other.html
+        name: 'other.html',
+        assets: ['other.html'],
+      },
+      {
+        // foo/other.html
+        name: 'other.html',
+        assets: ['other.html'],
       },
       {
         type: 'svg',
         assets: ['icons.svg'],
       },
       {
-        type: 'css',
-        assets: ['index.css'],
-      },
-      {
-        type: 'html',
-        assets: ['other.html'],
+        type: 'png',
+        assets: ['100x100.png'],
       },
       {
         type: 'js',
         assets: ['index.js'],
+      },
+      {
+        type: 'css',
+        assets: ['index.css'],
       },
     ]);
 
@@ -211,6 +222,31 @@ describe('html', function () {
     assert(/<script src=".+?\.js"><\/script>$/.test(html));
   });
 
+  it('should insert empty script tag for HMR at the end of the body when having normal inline script', async function () {
+    const b = await bundle(
+      path.join(__dirname, '/integration/html-inline-js/index.html'),
+      {
+        hmrOptions: {},
+      },
+    );
+
+    assertBundles(b, [
+      {type: 'js', assets: ['index.html']},
+      {type: 'js', assets: ['index.html']},
+      {type: 'js', assets: ['index.html']},
+      {type: 'js', assets: ['index.html']},
+      {type: 'js', assets: ['index.html']},
+      {name: 'index.html', assets: ['index.html']},
+    ]);
+
+    const html = await outputFS.readFile(
+      path.join(distDir, 'index.html'),
+      'utf8',
+    );
+
+    assert(/<script src=".+?\.js"><\/script><\/body>/.test(html));
+  });
+
   it('should support canonical links', async function () {
     let b = await bundle(
       path.join(__dirname, '/integration/html-canonical/index.html'),
@@ -279,6 +315,14 @@ describe('html', function () {
         name: 'logo.svg',
         assets: ['logo.svg'],
       },
+      {
+        type: 'png',
+        assets: ['logo.png'],
+      },
+      {
+        type: 'png',
+        assets: ['logo.png'],
+      },
     ]);
 
     let html = await outputFS.readFile(
@@ -287,6 +331,16 @@ describe('html', function () {
     );
     assert(html.includes(`<meta name="msapplication-config" content="none">`));
     assert(html.includes(`<meta property="og:image" content="/logo.svg">`));
+    assert(
+      /<meta name="msapplication-TileImage" content="\/logo\.[0-9a-f]+\.png">/.test(
+        html,
+      ),
+    );
+    assert(
+      /<meta name="msapplication-square70x70logo" content="\/logo\.[0-9a-f]+\.png">/.test(
+        html,
+      ),
+    );
     assert(
       html.includes(
         `<meta name="twitter:image" content="https://parceljs.org/assets/logo.svg">`,
@@ -404,12 +458,7 @@ describe('html', function () {
       },
       {
         type: 'js',
-        assets: [
-          'index.css',
-          'bundle-url.js',
-          'css-loader.js',
-          'hmr-runtime.js',
-        ],
+        assets: ['index.css', 'css-loader.js', 'hmr-runtime.js'],
       },
     ]);
 
@@ -453,7 +502,7 @@ describe('html', function () {
     );
 
     assert(
-      /^<link rel="stylesheet" href="[/\\]index\.[a-f0-9]+\.css">\s*<script src="[/\\]index\.[a-f0-9]+\.js" defer=""><\/script>\s*<h1>Hello/m.test(
+      /^<link rel="stylesheet" href="[/\\]index\.[a-f0-9]+\.css">\s*<script type="module" src="[/\\]index\.[a-f0-9]+\.js"><\/script>\s*<h1>Hello/m.test(
         html,
       ),
     );
@@ -496,7 +545,7 @@ describe('html', function () {
     );
 
     assert.equal(
-      html.match(/<script src="[/\\]{1}index\.[a-f0-9]+?\.js" defer="">/g)
+      html.match(/<script type="module" src="[/\\]{1}index\.[a-f0-9]+?\.js">/g)
         .length,
       2,
     );
@@ -625,6 +674,83 @@ describe('html', function () {
         '<svg version=1.1 baseprofile=full width=300 height=200 xmlns=http://www.w3.org/2000/svg><rect width=100% height=100% fill=red></rect><circle cx=150 cy=100 r=80 fill=green></circle><text x=150 y=125 font-size=60 text-anchor=middle fill=white>SVG</text></svg>',
       ),
     );
+  });
+
+  it('should detect the version of SVGO to use', async function () {
+    // Test is outside parcel so that svgo is not already installed.
+    await fsFixture(overlayFS, '/')`
+      htmlnano-svgo-version
+        index.html:
+          <!DOCTYPE html>
+          <html>
+            <body>
+              <svg><rect id="test" /></svg>
+            </body>
+          </html>
+
+        .htmlnanorc:
+          {
+            "minifySvg": {
+              "full": true
+            }
+          }
+
+        yarn.lock:
+    `;
+
+    let messages = [];
+    let loggerDisposable = Logger.onLog(message => {
+      if (message.level !== 'verbose') {
+        messages.push(message);
+      }
+    });
+
+    try {
+      await bundle(path.join('/htmlnano-svgo-version/index.html'), {
+        inputFS: overlayFS,
+        defaultTargetOptions: {
+          shouldOptimize: true,
+        },
+        shouldAutoinstall: false,
+      });
+    } catch (err) {
+      // autoinstall is disabled
+      assert.equal(
+        err.diagnostics[0].message,
+        md`Could not resolve module "svgo" from "${path.resolve(
+          overlayFS.cwd(),
+          '/htmlnano-svgo-version/index',
+        )}"`,
+      );
+    }
+
+    loggerDisposable.dispose();
+    assert(
+      messages[0].diagnostics[0].message.startsWith(
+        'Detected deprecated SVGO v2 options in',
+      ),
+    );
+    assert.deepEqual(messages[0].diagnostics[0].codeFrames, [
+      {
+        filePath: path.resolve(
+          overlayFS.cwd(),
+          '/htmlnano-svgo-version/.htmlnanorc',
+        ),
+        codeHighlights: [
+          {
+            message: undefined,
+            start: {
+              line: 3,
+              column: 5,
+            },
+            end: {
+              line: 3,
+              column: 16,
+            },
+          },
+        ],
+      },
+    ]);
   });
 
   it('should not minify default values inside HTML in production mode', async function () {
@@ -949,7 +1075,7 @@ describe('html', function () {
     let contents = await outputFS.readFile(b.getBundles()[0].filePath, 'utf8');
     assert(
       contents.includes(
-        '<svg><symbol id="all"><rect width="100" height="100"/></symbol></svg><svg><use xlink:href="#all" href="#all"/></svg>',
+        '<svg><symbol id="all"><rect width="100" height="100"/></symbol></svg><svg><use href="#all"/></svg>',
       ),
     );
   });
@@ -1389,7 +1515,7 @@ describe('html', function () {
               ),
               codeHighlights: [
                 {
-                  message: null,
+                  message: undefined,
                   start: {
                     line: 5,
                     column: 7,
@@ -1435,7 +1561,7 @@ describe('html', function () {
       'utf8',
     );
     assert(!html.includes('swc/helpers'));
-    assert(html.includes('slicedToArray'));
+    assert(html.includes('sliced_to_array'));
   });
 
   it('should allow imports and requires in inline <script> tags', async function () {
@@ -1603,30 +1729,6 @@ describe('html', function () {
     assert(!/class \$[a-f0-9]+\$var\$Useless \{/.test(js));
   });
 
-  it('should remove type="module" when not scope hoisting', async function () {
-    let b = await bundle(
-      path.join(__dirname, '/integration/html-js/index.html'),
-    );
-
-    await assertBundles(b, [
-      {
-        type: 'js',
-        assets: ['esmodule-helpers.js', 'index.js', 'other.js'],
-      },
-      {
-        name: 'index.html',
-        assets: ['index.html'],
-      },
-    ]);
-
-    let html = await outputFS.readFile(
-      path.join(distDir, 'index.html'),
-      'utf8',
-    );
-    assert(!html.includes('<script type="module"'));
-    assert(html.includes('<script src='));
-  });
-
   it('should not add a nomodule version when all browsers support esmodules', async function () {
     let b = await bundle(
       path.join(__dirname, '/integration/html-js/index.html'),
@@ -1678,7 +1780,7 @@ describe('html', function () {
               filePath: path.join(__dirname, '/integration/html-js/index.js'),
               codeHighlights: [
                 {
-                  message: null,
+                  message: undefined,
                   start: {
                     line: 1,
                     column: 1,
@@ -1740,8 +1842,6 @@ describe('html', function () {
       {
         type: 'js',
         assets: [
-          'bundle-manifest.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'index.js',
           'index.js',
@@ -1751,7 +1851,7 @@ describe('html', function () {
       },
       {
         type: 'js',
-        assets: ['bundle-manifest.js', 'index.js', 'index.js', 'index.js'],
+        assets: ['index.js', 'index.js', 'index.js'],
       },
       {
         name: 'index.html',
@@ -1830,12 +1930,7 @@ describe('html', function () {
       },
       {
         type: 'js',
-        assets: [
-          'bundle-manifest.js',
-          'get-worker-url.js',
-          'index.js',
-          'lodash.js',
-        ],
+        assets: ['get-worker-url.js', 'index.js', 'lodash.js'],
       },
       {
         name: 'index.html',
@@ -1891,12 +1986,7 @@ describe('html', function () {
       },
       {
         type: 'js',
-        assets: [
-          'bundle-manifest.js',
-          'get-worker-url.js',
-          'index.js',
-          'lodash.js',
-        ],
+        assets: ['get-worker-url.js', 'index.js', 'lodash.js'],
       },
       {
         name: 'index.html',
@@ -2025,6 +2115,47 @@ describe('html', function () {
     }
   });
 
+  it('supports multiple dist targets', async function () {
+    let b = await bundle(
+      path.join(__dirname, '/integration/html-multi-targets/'),
+      {
+        mode: 'production',
+        defaultTargetOptions: {
+          shouldScopeHoist: false,
+          shouldOptimize: false,
+          sourceMaps: false,
+        },
+      },
+    );
+    assertBundles(b, [
+      {
+        name: 'index.html',
+        type: 'html',
+        assets: ['index.html'],
+      },
+      {
+        type: 'js',
+        assets: ['index.js'],
+      },
+      {
+        type: 'js',
+        assets: ['esmodule-helpers.js', 'shared.js'],
+      },
+      {
+        type: 'js',
+        assets: ['esmodule-helpers.js', 'shared.js'],
+      },
+      {
+        name: 'index.html',
+        type: 'html',
+        assets: ['index.html'],
+      },
+      {
+        type: 'js',
+        assets: ['index.js'],
+      },
+    ]);
+  });
   it('should isolate async scripts', async function () {
     let b = await bundle(
       path.join(__dirname, '/integration/html-async-script/index.html'),
@@ -2079,25 +2210,13 @@ describe('html', function () {
         assets: ['index.html'],
       },
       {
-        assets: ['a.js', 'bundle-manifest.js'],
+        assets: ['a.js'],
       },
       {
-        assets: [
-          'a.js',
-          'bundle-manifest.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'js-loader.js',
-        ],
+        assets: ['a.js', 'cacheLoader.js', 'js-loader.js'],
       },
       {
-        assets: [
-          'b.js',
-          'bundle-manifest.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'js-loader.js',
-        ],
+        assets: ['b.js', 'cacheLoader.js', 'js-loader.js'],
       },
       {
         assets: ['c.js'],
@@ -2130,6 +2249,18 @@ describe('html', function () {
 
     assertBundles(b, [
       {
+        type: 'js',
+        assets: ['a.html'],
+      },
+      {
+        type: 'js',
+        assets: ['b.html'],
+      },
+      {
+        type: 'js',
+        assets: ['c.html'],
+      },
+      {
         name: 'a.html',
         type: 'html',
         assets: ['a.html'],
@@ -2145,20 +2276,12 @@ describe('html', function () {
         assets: ['c.html'],
       },
       {
-        type: 'js',
-        assets: ['a.html', 'shared.js'],
-      },
-      {
-        type: 'js',
-        assets: ['b.html', 'shared.js'],
-      },
-      {
-        type: 'js',
-        assets: ['c.html', 'shared.js'],
-      },
-      {
         type: 'css',
-        assets: ['shared.css', 'other.css'],
+        assets: ['other.css', 'shared.css'],
+      },
+      {
+        type: 'js',
+        assets: ['shared.js'],
       },
     ]);
 
@@ -2188,7 +2311,21 @@ describe('html', function () {
       },
     );
     let bundles = b.getBundles();
-
+    assertBundles(b, [
+      {
+        name: 'index.html',
+        type: 'html',
+        assets: ['index.html'],
+      },
+      {
+        type: 'js',
+        assets: ['index.js', 'index.js', 'index.js', 'index.js', 'client.js'],
+      },
+      {
+        type: 'js',
+        assets: ['viewer.js'],
+      },
+    ]);
     let html = await outputFS.readFile(
       path.join(distDir, 'index.html'),
       'utf8',
@@ -2228,12 +2365,9 @@ describe('html', function () {
     // reuse the b.css bundle from b.html.
     let html = await outputFS.readFile(path.join(distDir, 'a.html'), 'utf8');
     assert.equal(
-      html.match(/<link rel="stylesheet" href="\/a\.[a-z0-9]+\.css">/g).length,
-      1,
-    );
-    assert.equal(
-      html.match(/<link rel="stylesheet" href="\/b\.[a-z0-9]+\.css">/g).length,
-      1,
+      html.match(/<link rel="stylesheet" href="\/\w+\.[a-z0-9]+\.css">/g)
+        .length,
+      2,
     );
 
     // a.html should reference a.js only
@@ -2242,7 +2376,7 @@ describe('html', function () {
     assert.equal(html.match(/b\.[a-z0-9]+\.js/g), null);
 
     let css = await outputFS.readFile(
-      path.join(distDir, html.match(/\/a\.[a-z0-9]+\.css/)[0]),
+      path.join(distDir, html.match(/\/\w+\.[a-z0-9]+\.css/g)[0]),
       'utf8',
     );
     assert(css.includes('.a {'));
@@ -2252,11 +2386,8 @@ describe('html', function () {
     // It should not point to the bundle containing a.css from a.html
     html = await outputFS.readFile(path.join(distDir, 'b.html'), 'utf8');
     assert.equal(
-      html.match(/<link rel="stylesheet" href="\/a\.[a-z0-9]+\.css">/g),
-      null,
-    );
-    assert.equal(
-      html.match(/<link rel="stylesheet" href="\/b\.[a-z0-9]+\.css">/g).length,
+      html.match(/<link rel="stylesheet" href="\/\w+\.[a-z0-9]+\.css">/g)
+        .length,
       1,
     );
 
@@ -2266,7 +2397,7 @@ describe('html', function () {
     assert.equal(html.match(/b\.[a-z0-9]+\.js/g).length, 1);
 
     css = await outputFS.readFile(
-      path.join(distDir, html.match(/\/b\.[a-z0-9]+\.css/)[0]),
+      path.join(distDir, html.match(/\/\w+\.[a-z0-9]+\.css/)[0]),
       'utf8',
     );
     assert(!css.includes('.a {'));
@@ -2279,26 +2410,26 @@ describe('html', function () {
     });
 
     let html = await outputFS.readFile(path.join(distDir, 'a.html'), 'utf8');
-    assert.equal(html.match(/<script/g).length, 3);
+    assert.equal(html.match(/<script/g).length, 2);
 
     html = await outputFS.readFile(path.join(distDir, 'b.html'), 'utf8');
-    assert.equal(html.match(/<script/g).length, 5);
+    assert.equal(html.match(/<script/g).length, 2);
 
     html = await outputFS.readFile(path.join(distDir, 'c.html'), 'utf8');
-    assert.equal(html.match(/<script/g).length, 5);
+    assert.equal(html.match(/<script/g).length, 2);
 
     html = await outputFS.readFile(path.join(distDir, 'd.html'), 'utf8');
-    assert.equal(html.match(/<script/g).length, 4);
+    assert.equal(html.match(/<script/g).length, 2);
 
     html = await outputFS.readFile(path.join(distDir, 'e.html'), 'utf8');
-    assert.equal(html.match(/<script/g).length, 4);
+    assert.equal(html.match(/<script/g).length, 1);
 
     html = await outputFS.readFile(path.join(distDir, 'f.html'), 'utf8');
-    assert.equal(html.match(/<script/g).length, 3);
+    assert.equal(html.match(/<script/g).length, 1);
 
     // b.html hitting the parallel request limit should not prevent g.html from being optimized
     html = await outputFS.readFile(path.join(distDir, 'g.html'), 'utf8');
-    assert.equal(html.match(/<script/g).length, 5);
+    assert.equal(html.match(/<script/g).length, 1);
   });
 
   it('should not add CSS to a worker bundle group', async function () {
@@ -2323,7 +2454,6 @@ describe('html', function () {
         type: 'js',
         assets: [
           'a.js',
-          'bundle-url.js',
           'esmodule-helpers.js',
           'get-worker-url.js',
           'index.js',
@@ -2356,6 +2486,14 @@ describe('html', function () {
       {
         type: 'js',
         assets: ['form.js', 'a.js', 'a.module.css', 'esmodule-helpers.js'],
+      },
+      {
+        type: 'css',
+        assets: ['a.module.css'],
+      },
+      {
+        type: 'css',
+        assets: ['a.module.css'],
       },
       {
         type: 'css',
@@ -2549,7 +2687,7 @@ describe('html', function () {
     await getNextBuild(b);
 
     let html = await outputFS.readFile('/dist/index.html', 'utf8');
-    assert(html.includes(`console.log("test")`));
+    assert(html.includes(`console.log('test')`));
 
     await overlayFS.writeFile(
       path.join(__dirname, '/html-inline-js-require/test.js'),
@@ -2558,7 +2696,7 @@ describe('html', function () {
     await getNextBuild(b);
 
     html = await outputFS.readFile(path.join(distDir, '/index.html'), 'utf8');
-    assert(html.includes(`console.log("foo")`));
+    assert(html.includes(`console.log('foo')`));
   });
 
   it('should invalidate parent bundle when nested inline bundles change', async function () {
@@ -2673,6 +2811,50 @@ describe('html', function () {
     });
   });
 
+  it('should share older JS sibling (script) assets to younger siblings', async function () {
+    // JS script tags are siblings to a common parent, and are marked as such by parallel dependency priority
+    // Becuase of load order any older sibling (and it's assets) are loaded before any subsequent sibling
+    // Which means no younger sibling should have to reference sibling bundles for assets in them
+    let b = await bundle(
+      path.join(
+        __dirname,
+        'integration/scope-hoisting/es6/sibling-dependencies/index.html',
+      ),
+    );
+    assertBundles(b, [
+      {
+        name: 'index.html',
+        assets: ['index.html'],
+      },
+      {
+        assets: ['a.js', 'esmodule-helpers.js'],
+      },
+      {
+        assets: ['b.js'],
+      },
+    ]);
+
+    let youngerSibling; // bundle containing younger sibling, b.js
+    let olderSibling; // bundle containing old sibling, a.js
+    b.traverseBundles(bundle => {
+      bundle.traverseAssets(asset => {
+        if (asset.filePath.includes('b.js')) {
+          youngerSibling = bundle;
+        } else if (asset.filePath.includes('a.js')) {
+          olderSibling = bundle;
+        }
+      });
+    });
+
+    assert(
+      b.getReferencedBundles(youngerSibling).filter(b => b == olderSibling)
+        .length == 0,
+    );
+
+    let res = await run(b, {output: null}, {require: false});
+    assert.equal(res.output, 'a');
+  });
+
   it('should escape quotes in inline style attributes and style tags', async function () {
     let b = await bundle(
       path.join(__dirname, 'integration/html-inline-escape/style.html'),
@@ -2743,7 +2925,11 @@ describe('html', function () {
 
     let output = await outputFS.readFile(b.getBundles()[0].filePath, 'utf8');
     assert(output.includes('<x-custom stddeviation="0.5"'));
-    assert(output.includes('<svg role="img" viewBox='));
+    assert(
+      output.includes(
+        '<svg preserveAspectRatio="xMinYMin meet" role="img" viewBox=',
+      ),
+    );
     assert(output.includes('<filter'));
     assert(output.includes('<feGaussianBlur in="SourceGraphic" stdDeviation='));
   });
@@ -2870,5 +3056,185 @@ describe('html', function () {
     );
 
     await run(b, {output: null}, {require: false});
+  });
+
+  it('should insert bundle manifest into the correct bundle with multiple script tags', async function () {
+    const dir = path.join(__dirname, 'manifest-multi-script');
+    overlayFS.mkdirp(dir);
+
+    await fsFixture(overlayFS, dir)`
+        index.html:
+          <body>
+            <script src="./polyfills.js" type="module"></script>
+            <script src="./main.js" type="module"></script>
+          </body>
+
+        polyfills.js:
+          import('./polyfills-async');
+        polyfills-async.js:
+          export const foo = 2;
+        main.js:
+          import('./main-async');
+        main-async.js:
+          export const bar = 3;
+        `;
+
+    let b = await bundle(path.join(dir, '/index.html'), {
+      inputFS: overlayFS,
+    });
+
+    // Should not error with "Cannot find module" error at runtime.
+    await run(b);
+  });
+
+  describe('import maps', function () {
+    let dir;
+    let count = 0;
+    beforeEach(async () => {
+      dir = path.join(__dirname, 'html-import-maps-' + ++count);
+      await overlayFS.mkdirp(dir);
+    });
+
+    it('should generate an import map', async function () {
+      await fsFixture(overlayFS, dir)`
+        index.html:
+          <body>
+            <script src="./main.js" type="module"></script>
+          </body>
+        main.js:
+          globalThis.output = async () => (await import('./main-async')).bar();
+        main-async.js:
+          import './main-async.css';
+          export const bar = async () => (await import('./nested-async')).bar + 3;
+        main-async.css:
+          .foo { color: red }
+        nested-async.js:
+          import './nested-async.css';
+          export const bar = 4;
+        nested-async.css:
+          .bar { color: green }
+        `;
+
+      let b = await bundle(path.join(dir, '/index.html'), {
+        inputFS: overlayFS,
+        mode: 'production',
+      });
+
+      let html = await overlayFS.readFile(b.getBundles()[0].filePath, 'utf8');
+      let importMap = JSON.parse(
+        html.match(/<script type="importmap">(.*?)<\/script>/)[1],
+      );
+      assert.deepEqual(importMap, {
+        imports: {
+          [b.getBundles()[2].publicId]:
+            '/' + path.basename(b.getBundles()[2].filePath),
+          [b.getBundles()[3].publicId]:
+            '/' + path.basename(b.getBundles()[3].filePath),
+          [b.getBundles()[4].publicId]:
+            '/' + path.basename(b.getBundles()[4].filePath),
+          [b.getBundles()[5].publicId]:
+            '/' + path.basename(b.getBundles()[5].filePath),
+        },
+      });
+
+      assert(
+        html.indexOf('<script type="importmap">') < html.indexOf('<script src'),
+      );
+
+      let res = await run(b, null, {require: false});
+      let value = await res.output();
+      assert.equal(value, 7);
+    });
+
+    it('should merge with an existing import map', async function () {
+      await fsFixture(overlayFS, dir)`
+        index.html:
+          <body>
+            <script type="importmap">
+              {"imports": {"react": "https://esm.sh/react@18.2.0"}}
+            </script>
+            <script type="module" src="./main.js"></script>
+          </body>
+        main.js:
+          globalThis.output = async () => (await import('./main-async')).bar;
+        main-async.js:
+          export const bar = 3;
+        `;
+
+      let b = await bundle(path.join(dir, '/index.html'), {
+        inputFS: overlayFS,
+        mode: 'production',
+      });
+
+      let html = await overlayFS.readFile(b.getBundles()[0].filePath, 'utf8');
+      let importMap = JSON.parse(
+        html.match(/<script type="importmap">(.*?)<\/script>/)[1],
+      );
+      assert.deepEqual(importMap, {
+        imports: {
+          react: 'https://esm.sh/react@18.2.0',
+          [b.getBundles()[2].publicId]:
+            '/' + path.basename(b.getBundles()[2].filePath),
+        },
+      });
+
+      assert(
+        html.indexOf('<script type="importmap">') <
+          html.indexOf('<script type="module"'),
+      );
+
+      let res = await run(b, null, {require: false});
+      let value = await res.output();
+      assert.equal(value, 3);
+    });
+
+    it('should merge with an existing import map with shared bundles', async function () {
+      await fsFixture(overlayFS, dir)`
+        index.html:
+          <html>
+            <body>
+              <script type="importmap">
+                {"imports": {"react": "https://esm.sh/react@18.2.0"}}
+              </script>
+              <script type="module" src="./main.js"></script>
+            </body>
+          </html>
+        main.js:
+          import 'lodash';
+          globalThis.output = async () => (await import('./main-async')).bar;
+        main-async.js:
+          export const bar = 3;
+        other.html:
+          <script type="module" src="./other.js"></script>
+        other.js:
+          import 'lodash';
+        `;
+
+      let b = await bundle(path.join(dir, '/*.html'), {
+        inputFS: overlayFS,
+        mode: 'production',
+      });
+
+      let html = await overlayFS.readFile(b.getBundles()[0].filePath, 'utf8');
+      let importMap = JSON.parse(
+        html.match(/<script type="importmap">(.*?)<\/script>/)[1],
+      );
+      assert.deepEqual(importMap, {
+        imports: {
+          react: 'https://esm.sh/react@18.2.0',
+          [b.getBundles()[2].publicId]:
+            '/' + path.basename(b.getBundles()[2].filePath),
+        },
+      });
+
+      assert(
+        html.indexOf('<script type="importmap">') <
+          html.indexOf('<script type="module"'),
+      );
+
+      let res = await run(b, null, {require: false});
+      let value = await res.output();
+      assert.equal(value, 3);
+    });
   });
 });

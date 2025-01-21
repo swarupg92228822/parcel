@@ -2,7 +2,7 @@
 
 import type {FilePath, Asset, MutableAsset, PluginOptions} from '@parcel/types';
 
-import {hashString} from '@parcel/hash';
+import {hashString} from '@parcel/rust';
 import {glob} from '@parcel/utils';
 import {Transformer} from '@parcel/plugin';
 import nullthrows from 'nullthrows';
@@ -159,7 +159,7 @@ export default (new Transformer({
         'postcss-modules',
         asset.filePath,
         {
-          range: '^4.3.0',
+          range: '^6.0.0',
           saveDev: true,
           shouldAutoInstall: options.shouldAutoInstall,
         },
@@ -287,7 +287,7 @@ async function createLoader(
   options: PluginOptions,
 ) {
   let {default: FileSystemLoader} = await options.packageManager.require(
-    'postcss-modules/build/css-loader-core/loader',
+    'postcss-modules/build/FileSystemLoader',
     asset.filePath,
   );
   return class ParcelFileSystemLoader extends FileSystemLoader {

@@ -1,33 +1,42 @@
-use crate::dependency_collector::{DependencyDescriptor, DependencyKind};
-use crate::hoist::{Collect, Import};
-use crate::id;
-use crate::utils::SourceLocation;
-use data_encoding::{BASE64, HEXLOWER};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use swc_atoms::JsWord;
-use swc_common::{Mark, Span, DUMMY_SP};
-use swc_ecmascript::ast::*;
-use swc_ecmascript::visit::{Fold, FoldWith, VisitWith};
+
+use data_encoding::{BASE64, HEXLOWER};
+use swc_core::{
+  common::{Mark, Span, SyntaxContext, DUMMY_SP},
+  ecma::{
+    ast::*,
+    atoms::JsWord,
+    utils::stack_size::maybe_grow_default,
+    visit::{Fold, FoldWith, VisitWith},
+  },
+};
+
+use crate::{
+  collect::{Collect, Import},
+  dependency_collector::{DependencyDescriptor, DependencyFlags, DependencyKind},
+  id,
+  utils::SourceLocation,
+};
 
 pub fn inline_fs<'a>(
   filename: &str,
-  source_map: swc_common::sync::Lrc<swc_common::SourceMap>,
-  decls: HashSet<Id>,
+  source_map: swc_core::common::sync::Lrc<swc_core::common::SourceMap>,
+  unresolved_mark: Mark,
   global_mark: Mark,
   project_root: &'a str,
   deps: &'a mut Vec<DependencyDescriptor>,
+  is_module: bool,
 ) -> impl Fold + 'a {
   InlineFS {
     filename: Path::new(filename).to_path_buf(),
     collect: Collect::new(
       source_map,
-      decls,
+      unresolved_mark,
       Mark::fresh(Mark::root()),
       global_mark,
       false,
+      is_module,
     ),
-    global_mark,
     project_root,
     deps,
   }
@@ -36,7 +45,6 @@ pub fn inline_fs<'a>(
 struct InlineFS<'a> {
   filename: PathBuf,
   collect: Collect,
-  global_mark: Mark,
   project_root: &'a str,
   deps: &'a mut Vec<DependencyDescriptor>,
 }
@@ -52,8 +60,8 @@ impl<'a> Fold for InlineFS<'a> {
       if let Callee::Expr(expr) = &call.callee {
         if let Some((source, specifier)) = self.match_module_reference(expr) {
           if &source == "fs" && &specifier == "readFileSync" {
-            if let Some(arg) = call.args.get(0) {
-              if let Some(res) = self.evaluate_fs_arg(&*arg.expr, call.args.get(1), call.span) {
+            if let Some(arg) = call.args.first() {
+              if let Some(res) = self.evaluate_fs_arg(&arg.expr, call.args.get(1), call.span) {
                 return res;
               }
             }
@@ -62,7 +70,7 @@ impl<'a> Fold for InlineFS<'a> {
       }
     }
 
-    node.fold_children_with(self)
+    maybe_grow_default(|| node.fold_children_with(self))
   }
 }
 
@@ -90,7 +98,7 @@ impl<'a> InlineFS<'a> {
           _ => return None,
         };
 
-        if let Some(source) = self.collect.match_require(&*member.obj) {
+        if let Some(source) = self.collect.match_require(&member.obj) {
           return Some((source, prop));
         }
 
@@ -127,7 +135,7 @@ impl<'a> InlineFS<'a> {
           Ok(path) => path,
           Err(_err) => return None,
         };
-        if !path.starts_with(&self.project_root) {
+        if !path.starts_with(self.project_root) {
           return None;
         }
 
@@ -174,8 +182,7 @@ impl<'a> InlineFS<'a> {
           loc: SourceLocation::from(&self.collect.source_map, span),
           specifier: path.to_str().unwrap().into(),
           attributes: None,
-          is_optional: false,
-          is_helper: false,
+          flags: DependencyFlags::empty(),
           source_type: None,
           placeholder: None,
         });
@@ -186,9 +193,10 @@ impl<'a> InlineFS<'a> {
             callee: Callee::Expr(Box::new(Expr::Member(MemberExpr {
               obj: Box::new(Expr::Ident(Ident::new(
                 "Buffer".into(),
-                DUMMY_SP.apply_mark(self.global_mark),
+                DUMMY_SP,
+                SyntaxContext::empty().apply_mark(self.collect.unresolved_mark),
               ))),
-              prop: MemberProp::Ident(Ident::new("from".into(), DUMMY_SP)),
+              prop: MemberProp::Ident(IdentName::new("from".into(), DUMMY_SP)),
               span: DUMMY_SP,
             }))),
             args: vec![
@@ -202,6 +210,7 @@ impl<'a> InlineFS<'a> {
               },
             ],
             span: DUMMY_SP,
+            ctxt: SyntaxContext::empty(),
             type_args: None,
           }))
         } else {
@@ -219,7 +228,7 @@ struct Evaluator<'a> {
 
 impl<'a> Fold for Evaluator<'a> {
   fn fold_expr(&mut self, node: Expr) -> Expr {
-    let node = node.fold_children_with(self);
+    let node = maybe_grow_default(|| node.fold_children_with(self));
 
     match &node {
       Expr::Ident(ident) => match ident.sym.to_string().as_str() {
@@ -254,7 +263,7 @@ impl<'a> Fold for Evaluator<'a> {
       },
       Expr::Call(call) => {
         let callee = match &call.callee {
-          Callee::Expr(expr) => &*expr,
+          Callee::Expr(expr) => expr,
           _ => return node,
         };
 

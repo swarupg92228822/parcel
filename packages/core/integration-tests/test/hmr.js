@@ -189,7 +189,7 @@ describe('hmr', function () {
 
       assert.equal(message.type, 'update');
 
-      assert.equal(message.assets.length, 2);
+      assert.equal(message.assets.length, 1);
     });
 
     it('should emit an HMR error on bundle failure', async function () {
@@ -447,10 +447,10 @@ module.hot.dispose((data) => {
         ['eval:local', 1, null],
         ['eval:index', 1, null],
         ['dispose:other', 1],
-        ['eval:other', 3, {value: 1}],
         ['dispose:local', 1],
-        ['eval:local', 3, {value: 1}],
         ['dispose:index', 1],
+        ['eval:other', 3, {value: 1}],
+        ['eval:local', 3, {value: 1}],
         ['eval:index', 3, {value: 1}],
       ]);
     });
@@ -516,15 +516,64 @@ module.hot.dispose((data) => {
     });
 
     it('should work across bundles', async function () {
-      let {reloaded} = await testHMRClient('hmr-dynamic', outputs => {
+      let {reloaded, outputs} = await testHMRClient('hmr-dynamic', outputs => {
         assert.deepEqual(outputs, [3]);
         return {
           'local.js': 'exports.a = 5; exports.b = 5;',
         };
       });
 
-      // assert.deepEqual(outputs, [3, 10]);
-      assert(reloaded); // TODO: this should eventually not reload...
+      assert.deepEqual(outputs, [3, 10]);
+      assert(!reloaded);
+    });
+
+    it('should work when an asset is duplicated', async function () {
+      let {reloaded, outputs} = await testHMRClient(
+        'hmr-duplicate',
+        outputs => {
+          assert.deepEqual(outputs, [7]);
+          return {
+            'shared.js': 'exports.a = 5;',
+          };
+        },
+      );
+
+      assert.deepEqual(outputs, [7, 13]);
+      assert(!reloaded);
+    });
+
+    it('should bubble to parents if child returns additional parents', async function () {
+      let {reloaded, outputs} = await testHMRClient('hmr-parents', outputs => {
+        assert.deepEqual(outputs, ['child 2', 'root']);
+        return {
+          'updated.js': 'exports.a = 3;',
+        };
+      });
+
+      assert.deepEqual(outputs, [
+        'child 2',
+        'root',
+        'child 3',
+        'accept child',
+        'root',
+        'accept root',
+      ]);
+      assert(!reloaded);
+    });
+
+    it('should bubble to parents and reload if they do not accept', async function () {
+      let {reloaded, outputs} = await testHMRClient(
+        'hmr-parents-reload',
+        outputs => {
+          assert.deepEqual(outputs, ['child 2', 'root']);
+          return {
+            'updated.js': 'exports.a = 3;',
+          };
+        },
+      );
+
+      assert.deepEqual(outputs, []);
+      assert(reloaded);
     });
 
     it('should work with urls', async function () {
@@ -879,6 +928,14 @@ module.hot.dispose((data) => {
       let bundleEvent = await getNextBuild(b);
       assert.equal(bundleEvent.type, 'buildSuccess');
 
+      // JSDOM doesn't support type=module
+      // https://github.com/jsdom/jsdom/issues/2475
+      let htmlPath = nullthrows(bundleEvent.bundleGraph).getBundles()[0]
+        .filePath;
+      let html = await outputFS.readFile(htmlPath, 'utf8');
+      html = html.replace(/type="module"/g, '');
+      await outputFS.writeFile(htmlPath, html);
+
       let window;
       try {
         let dom = await JSDOM.JSDOM.fromURL(
@@ -941,6 +998,14 @@ module.hot.dispose((data) => {
       subscription = await b.watch();
       let bundleEvent = await getNextBuild(b);
       assert.equal(bundleEvent.type, 'buildSuccess');
+
+      // JSDOM doesn't support type=module
+      // https://github.com/jsdom/jsdom/issues/2475
+      let htmlPath = nullthrows(bundleEvent.bundleGraph).getBundles()[0]
+        .filePath;
+      let html = await outputFS.readFile(htmlPath, 'utf8');
+      html = html.replace(/type="module"/g, '');
+      await outputFS.writeFile(htmlPath, html);
 
       let window;
       try {

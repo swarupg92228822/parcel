@@ -1,0 +1,33 @@
+{
+  "name": "parcel-react-server-starter",
+  "private": true,
+  "version": "0.0.0",
+  "server": "dist/server.js",
+  "source": "src/server.tsx",
+  "targets": {
+    "server": {
+      "context": "react-server",
+      "includeNodeModules": {
+        "express": false
+      }
+    }
+  },
+  "scripts": {
+    "start": "parcel",
+    "build": "parcel build"
+  },
+  "dependencies": {
+    "@parcel/rsc": "canary",
+    "express": "^4.21.2",
+    "react": "canary",
+    "react-dom": "canary"
+  },
+  "devDependencies": {
+    "@types/express": "^4",
+    "@types/parcel-env": "^0.0.6",
+    "@types/node": "^22.10.5",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "parcel": "canary"
+  }
+}

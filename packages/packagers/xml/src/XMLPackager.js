@@ -26,7 +26,7 @@ export default (new Packager({
     let asset = assets[0];
     let code = await asset.getCode();
     let parser = new DOMParser();
-    let dom = parser.parseFromString(code);
+    let dom = parser.parseFromString(code, 'application/xml');
 
     let inlineElements = dom.getElementsByTagNameNS(
       'https://parceljs.org',
@@ -53,8 +53,11 @@ export default (new Packager({
             contents,
             'application/xml',
           );
-          element.parentNode.removeChild(element);
-          element.parentNode.appendChild(parsed.documentElement);
+          if (parsed.documentElement != null) {
+            let parent = element.parentNode;
+            parent.removeChild(element);
+            parent.appendChild(parsed.documentElement);
+          }
         } else {
           element.parentNode.textContent = contents;
         }

@@ -1,9 +1,10 @@
 [workspace]
+resolver = "2"
 members = [
-  "packages/transformers/js/core",
-  "packages/transformers/js/napi",
-  "packages/transformers/js/wasm",
-  "packages/utils/fs-search",
-  "packages/utils/hash",
-  "packages/optimizers/image"
+  "crates/*",
+  "packages/transformers/js/core"
 ]
+
+[profile.canary]
+inherits = "release"
+debug = true

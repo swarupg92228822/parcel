@@ -1,5 +1,5 @@
 // @flow
-/* global HMR_HOST, HMR_PORT, HMR_ENV_HASH, HMR_SECURE, chrome, browser, importScripts */
+/* global HMR_HOST, HMR_PORT, HMR_SERVER_PORT, HMR_ENV_HASH, HMR_SECURE, HMR_USE_SSE, chrome, browser, __parcel__import__, __parcel__importScripts__, ServiceWorkerGlobalScope */
 
 /*::
 import type {
@@ -9,7 +9,7 @@ import type {
 interface ParcelRequire {
   (string): mixed;
   cache: {|[string]: ParcelModule|};
-  hotData: mixed;
+  hotData: {|[string]: mixed|};
   Module: any;
   parent: ?ParcelRequire;
   isParcelRequire: true;
@@ -31,15 +31,23 @@ interface ParcelModule {
 interface ExtensionContext {
   runtime: {|
     reload(): void,
+    getURL(url: string): string;
+    getManifest(): {manifest_version: number, ...};
   |};
 }
 declare var module: {bundle: ParcelRequire, ...};
 declare var HMR_HOST: string;
 declare var HMR_PORT: string;
+declare var HMR_SERVER_PORT: string;
 declare var HMR_ENV_HASH: string;
 declare var HMR_SECURE: boolean;
+declare var HMR_USE_SSE: boolean;
 declare var chrome: ExtensionContext;
 declare var browser: ExtensionContext;
+declare var __parcel__import__: (string) => Promise<void>;
+declare var __parcel__importScripts__: (string) => Promise<void>;
+declare var globalThis: typeof self;
+declare var ServiceWorkerGlobalScope: Object;
 */
 
 var OVERLAY_ID = '__parcel__error__overlay__';
@@ -49,7 +57,7 @@ var OldModule = module.bundle.Module;
 function Module(moduleName) {
   OldModule.call(this, moduleName);
   this.hot = {
-    data: module.bundle.hotData,
+    data: module.bundle.hotData[moduleName],
     _acceptCallbacks: [],
     _disposeCallbacks: [],
     accept: function (fn) {
@@ -59,39 +67,64 @@ function Module(moduleName) {
       this._disposeCallbacks.push(fn);
     },
   };
-  module.bundle.hotData = undefined;
+  module.bundle.hotData[moduleName] = undefined;
 }
 module.bundle.Module = Module;
+module.bundle.hotData = {};
 
 var checkedAssets /*: {|[string]: boolean|} */,
-  acceptedAssets /*: {|[string]: boolean|} */,
-  assetsToAccept /*: Array<[ParcelRequire, string]> */;
+  disposedAssets /*: {|[string]: boolean|} */,
+  assetsToDispose /*: Array<[ParcelRequire, string]> */,
+  assetsToAccept /*: Array<[ParcelRequire, string]> */,
+  bundleNotFound = false;
 
 function getHostname() {
   return (
     HMR_HOST ||
-    (location.protocol.indexOf('http') === 0 ? location.hostname : 'localhost')
+    (typeof location !== 'undefined' && location.protocol.indexOf('http') === 0
+      ? location.hostname
+      : 'localhost')
   );
 }
 
 function getPort() {
-  return HMR_PORT || location.port;
+  return (
+    HMR_PORT ||
+    (typeof location !== 'undefined' ? location.port : HMR_SERVER_PORT)
+  );
+}
+
+// eslint-disable-next-line no-redeclare
+let WebSocket = globalThis.WebSocket;
+if (!WebSocket && typeof module.bundle.root === 'function') {
+  try {
+    // eslint-disable-next-line no-global-assign
+    WebSocket = module.bundle.root('ws');
+  } catch {
+    // ignore.
+  }
 }
 
 // eslint-disable-next-line no-redeclare
 var parent = module.bundle.parent;
-if ((!parent || !parent.isParcelRequire) && typeof WebSocket !== 'undefined') {
+if (!parent || !parent.isParcelRequire) {
   var hostname = getHostname();
   var port = getPort();
   var protocol =
     HMR_SECURE ||
-    (location.protocol == 'https:' &&
-      !/localhost|127.0.0.1|0.0.0.0/.test(hostname))
+    (typeof location !== 'undefined' &&
+      location.protocol === 'https:' &&
+      !['localhost', '127.0.0.1', '0.0.0.0'].includes(hostname))
       ? 'wss'
       : 'ws';
-  var ws = new WebSocket(
-    protocol + '://' + hostname + (port ? ':' + port : '') + '/',
-  );
+
+  // Web extension context
+  var extCtx =
+    typeof browser === 'undefined'
+      ? typeof chrome === 'undefined'
+        ? null
+        : chrome
+      : browser;
 
   // Safari doesn't support sourceURL in error stacks.
   // eval may also be disabled via CSP, so do a quick check.
@@ -102,100 +135,159 @@ if ((!parent || !parent.isParcelRequire) && typeof WebSocket !== 'undefined') {
     supportsSourceURL = err.stack.includes('test.js');
   }
 
-  // $FlowFixMe
-  ws.onmessage = async function (event /*: {data: string, ...} */) {
-    checkedAssets = ({} /*: {|[string]: boolean|} */);
-    acceptedAssets = ({} /*: {|[string]: boolean|} */);
-    assetsToAccept = [];
+  var ws;
+  if (HMR_USE_SSE) {
+    ws = new EventSource('/__parcel_hmr');
+  } else {
+    try {
+      // If we're running in the dev server's node runner, listen for messages on the parent port.
+      let {workerData, parentPort} = (module.bundle.root(
+        'node:worker_threads',
+      ) /*: any*/);
+      if (workerData?.__parcel) {
+        parentPort.on('message', async message => {
+          try {
+            await handleMessage(message);
+            parentPort.postMessage('updated');
+          } catch {
+            parentPort.postMessage('restart');
+          }
+        });
 
-    var data /*: HMRMessage */ = JSON.parse(event.data);
-
-    if (data.type === 'update') {
-      // Remove error overlay if there is one
-      if (typeof document !== 'undefined') {
-        removeErrorOverlay();
+        // After the bundle has finished running, notify the dev server that the HMR update is complete.
+        queueMicrotask(() => parentPort.postMessage('ready'));
       }
-
-      let assets = data.assets.filter(asset => asset.envHash === HMR_ENV_HASH);
-
-      // Handle HMR Update
-      let handled = assets.every(asset => {
-        return (
-          asset.type === 'css' ||
-          (asset.type === 'js' &&
-            hmrAcceptCheck(module.bundle.root, asset.id, asset.depsByBundle))
-        );
-      });
-
-      if (handled) {
-        console.clear();
-
-        // Dispatch custom event so other runtimes (e.g React Refresh) are aware.
-        if (
-          typeof window !== 'undefined' &&
-          typeof CustomEvent !== 'undefined'
-        ) {
-          window.dispatchEvent(new CustomEvent('parcelhmraccept'));
-        }
-
-        await hmrApplyUpdates(assets);
-
-        for (var i = 0; i < assetsToAccept.length; i++) {
-          var id = assetsToAccept[i][1];
-          if (!acceptedAssets[id]) {
-            hmrAcceptRun(assetsToAccept[i][0], id);
+    } catch {
+      if (typeof WebSocket !== 'undefined') {
+        try {
+          ws = new WebSocket(
+            protocol + '://' + hostname + (port ? ':' + port : '') + '/',
+          );
+        } catch (err) {
+          if (err.message) {
+            console.error(err.message);
           }
         }
-      } else if ('reload' in location) {
-        location.reload();
-      } else {
-        // Web extension context
-        var ext =
-          typeof chrome === 'undefined'
-            ? typeof browser === 'undefined'
-              ? null
-              : browser
-            : chrome;
-        if (ext && ext.runtime && ext.runtime.reload) {
-          ext.runtime.reload();
+      }
+    }
+  }
+
+  if (ws) {
+    // $FlowFixMe
+    ws.onmessage = async function (event /*: {data: string, ...} */) {
+      var data /*: HMRMessage */ = JSON.parse(event.data);
+      await handleMessage(data);
+    };
+
+    if (ws instanceof WebSocket) {
+      ws.onerror = function (e) {
+        if (e.message) {
+          console.error(e.message);
+        }
+      };
+
+      ws.onclose = function (e) {
+        if (process.env.PARCEL_BUILD_ENV !== 'test') {
+          console.warn('[parcel] 🚨 Connection to the HMR server was lost');
+        }
+      };
+    }
+  }
+}
+
+async function handleMessage(data /*: HMRMessage */) {
+  checkedAssets = ({} /*: {|[string]: boolean|} */);
+  disposedAssets = ({} /*: {|[string]: boolean|} */);
+  assetsToAccept = [];
+  assetsToDispose = [];
+  bundleNotFound = false;
+
+  if (data.type === 'reload') {
+    fullReload();
+  } else if (data.type === 'update') {
+    // Remove error overlay if there is one
+    if (typeof document !== 'undefined') {
+      removeErrorOverlay();
+    }
+
+    let assets = data.assets;
+
+    // Handle HMR Update
+    let handled = assets.every(asset => {
+      return (
+        asset.type === 'css' ||
+        (asset.type === 'js' &&
+          hmrAcceptCheck(module.bundle.root, asset.id, asset.depsByBundle))
+      );
+    });
+
+    // Dispatch a custom event in case a bundle was not found. This might mean
+    // an asset on the server changed and we should reload the page. This event
+    // gives the client an opportunity to refresh without losing state
+    // (e.g. via React Server Components). If e.preventDefault() is not called,
+    // we will trigger a full page reload.
+    if (
+      handled &&
+      bundleNotFound &&
+      assets.some(a => a.envHash !== HMR_ENV_HASH) &&
+      typeof window !== 'undefined' &&
+      typeof CustomEvent !== 'undefined'
+    ) {
+      handled = !window.dispatchEvent(
+        new CustomEvent('parcelhmrreload', {cancelable: true}),
+      );
+    }
+
+    if (handled) {
+      console.clear();
+
+      // Dispatch custom event so other runtimes (e.g React Refresh) are aware.
+      if (typeof window !== 'undefined' && typeof CustomEvent !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('parcelhmraccept'));
+      }
+
+      await hmrApplyUpdates(assets);
+
+      hmrDisposeQueue();
+
+      // Run accept callbacks. This will also re-execute other disposed assets in topological order.
+      let processedAssets = {};
+      for (let i = 0; i < assetsToAccept.length; i++) {
+        let id = assetsToAccept[i][1];
+
+        if (!processedAssets[id]) {
+          hmrAccept(assetsToAccept[i][0], id);
+          processedAssets[id] = true;
         }
       }
+    } else fullReload();
+  }
+
+  if (data.type === 'error') {
+    // Log parcel errors to console
+    for (let ansiDiagnostic of data.diagnostics.ansi) {
+      let stack = ansiDiagnostic.codeframe
+        ? ansiDiagnostic.codeframe
+        : ansiDiagnostic.stack;
+
+      console.error(
+        '🚨 [parcel]: ' +
+          ansiDiagnostic.message +
+          '\n' +
+          stack +
+          '\n\n' +
+          ansiDiagnostic.hints.join('\n'),
+      );
     }
 
-    if (data.type === 'error') {
-      // Log parcel errors to console
-      for (let ansiDiagnostic of data.diagnostics.ansi) {
-        let stack = ansiDiagnostic.codeframe
-          ? ansiDiagnostic.codeframe
-          : ansiDiagnostic.stack;
-
-        console.error(
-          '🚨 [parcel]: ' +
-            ansiDiagnostic.message +
-            '\n' +
-            stack +
-            '\n\n' +
-            ansiDiagnostic.hints.join('\n'),
-        );
-      }
-
-      if (typeof document !== 'undefined') {
-        // Render the fancy html overlay
-        removeErrorOverlay();
-        var overlay = createErrorOverlay(data.diagnostics.html);
-        // $FlowFixMe
-        document.body.appendChild(overlay);
-      }
+    if (typeof document !== 'undefined') {
+      // Render the fancy html overlay
+      removeErrorOverlay();
+      var overlay = createErrorOverlay(data.diagnostics.html);
+      // $FlowFixMe
+      document.body.appendChild(overlay);
     }
-  };
-  ws.onerror = function (e) {
-    console.error(e.message);
-  };
-  ws.onclose = function (e) {
-    if (process.env.PARCEL_BUILD_ENV !== 'test') {
-      console.warn('[parcel] 🚨 Connection to the HMR server was lost');
-    }
-  };
+  }
 }
 
 function removeErrorOverlay() {
@@ -251,6 +343,32 @@ ${frame.code}`;
   return overlay;
 }
 
+function fullReload() {
+  if (typeof location !== 'undefined' && 'reload' in location) {
+    location.reload();
+  } else if (
+    typeof extCtx !== 'undefined' &&
+    extCtx &&
+    extCtx.runtime &&
+    extCtx.runtime.reload
+  ) {
+    extCtx.runtime.reload();
+  } else {
+    try {
+      let {workerData, parentPort} = (module.bundle.root(
+        'node:worker_threads',
+      ) /*: any*/);
+      if (workerData?.__parcel) {
+        parentPort.postMessage('restart');
+      }
+    } catch (err) {
+      console.error(
+        '[parcel] ⚠️ An HMR update was not accepted. Please restart the process.',
+      );
+    }
+  }
+}
+
 function getParents(bundle, id) /*: Array<[ParcelRequire, string]> */ {
   var modules = bundle.modules;
   if (!modules) {
@@ -278,6 +396,11 @@ function getParents(bundle, id) /*: Array<[ParcelRequire, string]> */ {
 }
 
 function updateLink(link) {
+  var href = link.getAttribute('href');
+
+  if (!href) {
+    return;
+  }
   var newLink = link.cloneNode();
   newLink.onload = function () {
     if (link.parentNode !== null) {
@@ -288,7 +411,7 @@ function updateLink(link) {
   newLink.setAttribute(
     'href',
     // $FlowFixMe
-    link.getAttribute('href').split('?')[0] + '?' + Date.now(),
+    href.split('?')[0] + '?' + Date.now(),
   );
   // $FlowFixMe
   link.parentNode.insertBefore(newLink, link.nextSibling);
@@ -296,7 +419,7 @@ function updateLink(link) {
 
 var cssTimeout = null;
 function reloadCSS() {
-  if (cssTimeout) {
+  if (cssTimeout || typeof document === 'undefined') {
     return;
   }
 
@@ -325,6 +448,37 @@ function reloadCSS() {
   }, 50);
 }
 
+function hmrDownload(asset) {
+  if (asset.type === 'js') {
+    if (typeof document !== 'undefined') {
+      let script = document.createElement('script');
+      script.src = asset.url + '?t=' + Date.now();
+      if (asset.outputFormat === 'esmodule') {
+        script.type = 'module';
+      }
+      return new Promise((resolve, reject) => {
+        script.onload = () => resolve(script);
+        script.onerror = reject;
+        document.head?.appendChild(script);
+      });
+    } else if (typeof importScripts === 'function') {
+      // Worker scripts
+      if (asset.outputFormat === 'esmodule') {
+        return __parcel__import__(asset.url + '?t=' + Date.now());
+      } else {
+        return new Promise((resolve, reject) => {
+          try {
+            __parcel__importScripts__(asset.url + '?t=' + Date.now());
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        });
+      }
+    }
+  }
+}
+
 async function hmrApplyUpdates(assets) {
   global.parcelHotUpdate = Object.create(null);
 
@@ -337,27 +491,22 @@ async function hmrApplyUpdates(assets) {
     // https://bugs.webkit.org/show_bug.cgi?id=137297
     // This path is also taken if a CSP disallows eval.
     if (!supportsSourceURL) {
-      let promises = assets.map(asset => {
-        if (asset.type === 'js') {
-          if (typeof document !== 'undefined') {
-            let script = document.createElement('script');
-            script.src = asset.url;
-            return new Promise((resolve, reject) => {
-              script.onload = () => resolve(script);
-              script.onerror = reject;
-              document.head?.appendChild(script);
-            });
-          } else if (typeof importScripts === 'function') {
-            return new Promise((resolve, reject) => {
-              try {
-                importScripts(asset.url);
-              } catch (err) {
-                reject(err);
-              }
-            });
+      let promises = assets.map(asset =>
+        hmrDownload(asset)?.catch(err => {
+          // Web extension fix
+          if (
+            extCtx &&
+            extCtx.runtime &&
+            extCtx.runtime.getManifest().manifest_version == 3 &&
+            typeof ServiceWorkerGlobalScope != 'undefined' &&
+            global instanceof ServiceWorkerGlobalScope
+          ) {
+            extCtx.runtime.reload();
+            return;
           }
-        }
-      });
+          throw err;
+        }),
+      );
 
       scriptsToRemove = await Promise.all(promises);
     }
@@ -410,9 +559,14 @@ function hmrApply(bundle /*: ParcelRequire */, asset /*:  HMRAsset */) {
         (0, eval)(asset.output);
       }
 
+      // $FlowFixMe
       let fn = global.parcelHotUpdate[asset.id];
       modules[asset.id] = [fn, deps];
-    } else if (bundle.parent) {
+    }
+
+    // Always traverse to the parent bundle, even if we already replaced the asset in this bundle.
+    // This is required in case modules are duplicated. We need to ensure all instances have the updated code.
+    if (bundle.parent) {
       hmrApply(bundle.parent, asset);
     }
   }
@@ -453,6 +607,7 @@ function hmrAcceptCheck(
   id /*: string */,
   depsByBundle /*: ?{ [string]: { [string]: string } }*/,
 ) {
+  checkedAssets = {};
   if (hmrAcceptCheckOne(bundle, id, depsByBundle)) {
     return true;
   }
@@ -466,7 +621,7 @@ function hmrAcceptCheck(
     if (a) {
       // If this parent accepts, stop traversing upward, but still consider siblings.
       accepted = true;
-    } else {
+    } else if (a !== null) {
       // Otherwise, queue the parents in the next level upward.
       let p = getParents(module.bundle.root, v[1]);
       if (p.length === 0) {
@@ -495,54 +650,91 @@ function hmrAcceptCheckOne(
     // If we reached the root bundle without finding where the asset should go,
     // there's nothing to do. Mark as "accepted" so we don't reload the page.
     if (!bundle.parent) {
+      bundleNotFound = true;
       return true;
     }
 
-    return hmrAcceptCheck(bundle.parent, id, depsByBundle);
+    return hmrAcceptCheckOne(bundle.parent, id, depsByBundle);
   }
 
   if (checkedAssets[id]) {
-    return true;
+    return null;
   }
 
   checkedAssets[id] = true;
 
   var cached = bundle.cache[id];
-
-  assetsToAccept.push([bundle, id]);
-
-  if (!cached || (cached.hot && cached.hot._acceptCallbacks.length)) {
+  if (!cached) {
     return true;
   }
+
+  assetsToDispose.push([bundle, id]);
+
+  if (cached && cached.hot && cached.hot._acceptCallbacks.length) {
+    assetsToAccept.push([bundle, id]);
+    return true;
+  }
+
+  return false;
 }
 
-function hmrAcceptRun(bundle /*: ParcelRequire */, id /*: string */) {
+function hmrDisposeQueue() {
+  // Dispose all old assets.
+  for (let i = 0; i < assetsToDispose.length; i++) {
+    let id = assetsToDispose[i][1];
+
+    if (!disposedAssets[id]) {
+      hmrDispose(assetsToDispose[i][0], id);
+      disposedAssets[id] = true;
+    }
+  }
+
+  assetsToDispose = [];
+}
+
+function hmrDispose(bundle /*: ParcelRequire */, id /*: string */) {
   var cached = bundle.cache[id];
-  bundle.hotData = {};
+  bundle.hotData[id] = {};
   if (cached && cached.hot) {
-    cached.hot.data = bundle.hotData;
+    cached.hot.data = bundle.hotData[id];
   }
 
   if (cached && cached.hot && cached.hot._disposeCallbacks.length) {
     cached.hot._disposeCallbacks.forEach(function (cb) {
-      cb(bundle.hotData);
+      cb(bundle.hotData[id]);
     });
   }
 
   delete bundle.cache[id];
+}
+
+function hmrAccept(bundle /*: ParcelRequire */, id /*: string */) {
+  // Execute the module.
   bundle(id);
 
-  cached = bundle.cache[id];
+  // Run the accept callbacks in the new version of the module.
+  var cached = bundle.cache[id];
   if (cached && cached.hot && cached.hot._acceptCallbacks.length) {
+    let assetsToAlsoAccept = [];
     cached.hot._acceptCallbacks.forEach(function (cb) {
-      var assetsToAlsoAccept = cb(function () {
+      let additionalAssets = cb(function () {
         return getParents(module.bundle.root, id);
       });
-      if (assetsToAlsoAccept && assetsToAccept.length) {
-        // $FlowFixMe[method-unbinding]
-        assetsToAccept.push.apply(assetsToAccept, assetsToAlsoAccept);
+      if (Array.isArray(additionalAssets) && additionalAssets.length) {
+        assetsToAlsoAccept.push(...additionalAssets);
       }
     });
+
+    if (assetsToAlsoAccept.length) {
+      let handled = assetsToAlsoAccept.every(function (a) {
+        return hmrAcceptCheck(a[0], a[1]);
+      });
+
+      if (!handled) {
+        return fullReload();
+      }
+
+      hmrDisposeQueue();
+    }
   }
-  acceptedAssets[id] = true;
 }

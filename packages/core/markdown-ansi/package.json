@@ -1,6 +1,6 @@
 {
   "name": "@parcel/markdown-ansi",
-  "version": "2.6.0",
+  "version": "2.13.3",
   "description": "Blazing fast, zero configuration web application bundler",
   "publishConfig": {
     "access": "public"
@@ -17,9 +17,9 @@
   "main": "lib/markdown-ansi.js",
   "source": "src/markdown-ansi.js",
   "engines": {
-    "node": ">= 12.0.0"
+    "node": ">= 16.0.0"
   },
   "dependencies": {
-    "chalk": "^4.1.0"
+    "chalk": "^4.1.2"
   }
 }

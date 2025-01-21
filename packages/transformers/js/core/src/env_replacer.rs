@@ -1,56 +1,51 @@
-use std::collections::{HashMap, HashSet};
-use std::vec;
+use std::{
+  collections::{HashMap, HashSet},
+  vec,
+};
 
-use swc_atoms::JsWord;
-use swc_common::{Mark, DUMMY_SP};
-use swc_ecmascript::ast;
-use swc_ecmascript::visit::{Fold, FoldWith};
+use ast::*;
+use swc_core::{
+  common::{sync::Lrc, Mark, DUMMY_SP},
+  ecma::{
+    ast,
+    atoms::JsWord,
+    visit::{VisitMut, VisitMutWith},
+  },
+};
 
 use crate::utils::*;
-use ast::*;
 
+/// Replaces process.env usage with the literal strings for values referenced.
 pub struct EnvReplacer<'a> {
   pub replace_env: bool,
   pub is_browser: bool,
-  pub env: &'a HashMap<swc_atoms::JsWord, swc_atoms::JsWord>,
-  pub decls: &'a HashSet<Id>,
+  pub env: &'a HashMap<JsWord, JsWord>,
   pub used_env: &'a mut HashSet<JsWord>,
-  pub source_map: &'a swc_common::SourceMap,
+  pub source_map: Lrc<swc_core::common::SourceMap>,
   pub diagnostics: &'a mut Vec<Diagnostic>,
   pub unresolved_mark: Mark,
 }
 
-impl<'a> Fold for EnvReplacer<'a> {
-  fn fold_expr(&mut self, node: Expr) -> Expr {
+impl<'a> VisitMut for EnvReplacer<'a> {
+  fn visit_mut_expr(&mut self, node: &mut Expr) {
     // Replace assignments to process.browser with `true`
     // TODO: this seems questionable but we did it in the JS version??
-    if let Expr::Assign(ref assign) = node {
-      if let PatOrExpr::Pat(ref pat) = assign.left {
-        if let Pat::Expr(ref expr) = &**pat {
-          if let Expr::Member(ref member) = &**expr {
-            if self.is_browser && match_member_expr(member, vec!["process", "browser"], self.decls)
-            {
-              let mut res = assign.clone();
-              res.right = Box::new(Expr::Lit(Lit::Bool(Bool {
-                value: true,
-                span: DUMMY_SP,
-              })));
-              return Expr::Assign(res);
-            }
-          }
-        }
-      }
+    if let Some(value) = self.replace_browser_assignment(&node) {
+      *node = value;
+      return;
     }
 
     // Replace `'foo' in process.env` with a boolean.
     match &node {
       Expr::Bin(binary) if binary.op == BinaryOp::In => {
         if let (Expr::Lit(Lit::Str(left)), Expr::Member(member)) = (&*binary.left, &*binary.right) {
-          if match_member_expr(member, vec!["process", "env"], self.decls) {
-            return Expr::Lit(Lit::Bool(Bool {
+          if match_member_expr(member, vec!["process", "env"], self.unresolved_mark) {
+            self.used_env.insert(left.value.clone());
+            *node = Expr::Lit(Lit::Bool(Bool {
               value: self.env.contains_key(&left.value),
               span: DUMMY_SP,
             }));
+            return;
           }
         }
       }
@@ -58,83 +53,94 @@ impl<'a> Fold for EnvReplacer<'a> {
     }
 
     if let Expr::Member(ref member) = node {
-      if self.is_browser && match_member_expr(member, vec!["process", "browser"], self.decls) {
-        return Expr::Lit(Lit::Bool(Bool {
+      if self.is_browser
+        && match_member_expr(member, vec!["process", "browser"], self.unresolved_mark)
+      {
+        *node = Expr::Lit(Lit::Bool(Bool {
           value: true,
           span: DUMMY_SP,
         }));
+        return;
       }
 
       if !self.replace_env {
-        return node.fold_children_with(self);
+        node.visit_mut_children_with(self);
+        return;
       }
 
       if let Expr::Member(obj) = &*member.obj {
-        if match_member_expr(obj, vec!["process", "env"], self.decls) {
+        if match_member_expr(obj, vec!["process", "env"], self.unresolved_mark) {
           if let Some((sym, _)) = match_property_name(member) {
             if let Some(replacement) = self.replace(&sym, true) {
-              return replacement;
+              *node = replacement;
+              return;
             }
           }
         }
       }
     }
 
-    if let Expr::Assign(assign) = &node {
+    if let Expr::Assign(assign) = node {
       if !self.replace_env {
-        return node.fold_children_with(self);
+        node.visit_mut_children_with(self);
+        return;
       }
 
-      let expr = match &assign.left {
-        PatOrExpr::Pat(pat) => {
-          if let Pat::Expr(expr) = &**pat {
-            Some(&**expr)
-          } else if let Expr::Member(member) = &*assign.right {
-            if assign.op == AssignOp::Assign
-              && match_member_expr(member, vec!["process", "env"], self.decls)
-            {
-              let mut decls = vec![];
-              self.collect_pat_bindings(pat, &mut decls);
-
-              let mut exprs: Vec<Box<Expr>> = decls
-                .iter()
-                .map(|decl| {
-                  Box::new(Expr::Assign(AssignExpr {
-                    span: DUMMY_SP,
-                    op: AssignOp::Assign,
-                    left: PatOrExpr::Pat(Box::new(decl.name.clone())),
-                    right: Box::new(if let Some(init) = &decl.init {
-                      *init.clone()
-                    } else {
-                      Expr::Ident(get_undefined_ident(self.unresolved_mark))
-                    }),
-                  }))
-                })
-                .collect();
-
-              exprs.push(Box::new(Expr::Object(ObjectLit {
-                span: DUMMY_SP,
-                props: vec![],
-              })));
-
-              return Expr::Seq(SeqExpr {
-                span: assign.span,
-                exprs,
-              });
-            }
-            None
-          } else {
-            None
+      // process.env.FOO = ...;
+      if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assign.left {
+        if let Expr::Member(obj) = &*member.obj {
+          if match_member_expr(obj, vec!["process", "env"], self.unresolved_mark) {
+            self.emit_mutating_error(assign.span);
+            assign.right.visit_mut_with(self);
+            *node = *assign.right.clone();
+            return;
           }
         }
-        PatOrExpr::Expr(expr) => Some(&**expr),
-      };
+      }
 
-      if let Some(Expr::Member(MemberExpr { obj, .. })) = &expr {
-        if let Expr::Member(member) = &**obj {
-          if match_member_expr(member, vec!["process", "env"], self.decls) {
-            self.emit_mutating_error(assign.span);
-            return *assign.right.clone().fold_with(self);
+      if let Expr::Member(member) = &*assign.right {
+        if assign.op == AssignOp::Assign
+          && match_member_expr(member, vec!["process", "env"], self.unresolved_mark)
+        {
+          let pat = match &assign.left {
+            // ({x, y, z, ...} = process.env);
+            AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) => {
+              Some(Pat::Ident(ident.clone()))
+            }
+            // foo = process.env;
+            AssignTarget::Pat(AssignTargetPat::Object(obj)) => Some(obj.clone().into()),
+            _ => None,
+          };
+          if let Some(pat) = pat {
+            let mut decls = vec![];
+            self.collect_pat_bindings(&pat, &mut decls);
+
+            let mut exprs: Vec<Box<Expr>> = decls
+              .iter()
+              .map(|decl| {
+                Box::new(Expr::Assign(AssignExpr {
+                  span: DUMMY_SP,
+                  op: AssignOp::Assign,
+                  left: decl.name.clone().try_into().unwrap(),
+                  right: Box::new(if let Some(init) = &decl.init {
+                    *init.clone()
+                  } else {
+                    Expr::Ident(get_undefined_ident(self.unresolved_mark))
+                  }),
+                }))
+              })
+              .collect();
+
+            exprs.push(Box::new(Expr::Object(ObjectLit {
+              span: DUMMY_SP,
+              props: vec![],
+            })));
+
+            *node = Expr::Seq(SeqExpr {
+              span: assign.span,
+              exprs,
+            });
+            return;
           }
         }
       }
@@ -148,13 +154,18 @@ impl<'a> Fold for EnvReplacer<'a> {
         Expr::Update(UpdateExpr { arg, span, .. }) => {
           if let Expr::Member(MemberExpr { ref obj, .. }) = &**arg {
             if let Expr::Member(member) = &**obj {
-              if match_member_expr(member, vec!["process", "env"], self.decls) {
+              if match_member_expr(member, vec!["process", "env"], self.unresolved_mark) {
                 self.emit_mutating_error(*span);
-                return match &node {
+                *node = match &node {
                   Expr::Unary(_) => Expr::Lit(Lit::Bool(Bool { span: *span, value: true })),
-                  Expr::Update(_) => *arg.clone().fold_with(self),
+                  Expr::Update(_) => {
+                    // TODO: This can be written to run in-place to make it more efficient
+                    let mut replacement = *arg.clone();
+                    replacement.visit_mut_with(self);
+                    replacement
+                  }
                   _ => unreachable!()
-                }
+                };
               }
             }
           }
@@ -163,44 +174,74 @@ impl<'a> Fold for EnvReplacer<'a> {
       }
     }
 
-    node.fold_children_with(self)
+    node.visit_mut_children_with(self);
   }
 
-  fn fold_var_decl(&mut self, node: VarDecl) -> VarDecl {
+  fn visit_mut_var_decl(&mut self, node: &mut VarDecl) {
     if !self.replace_env {
-      return node.fold_children_with(self);
+      node.visit_mut_children_with(self);
+      return;
     }
 
     let mut decls = vec![];
     for decl in &node.decls {
       if let Some(init) = &decl.init {
         if let Expr::Member(member) = &**init {
-          if match_member_expr(member, vec!["process", "env"], self.decls) {
+          if match_member_expr(member, vec!["process", "env"], self.unresolved_mark) {
             self.collect_pat_bindings(&decl.name, &mut decls);
             continue;
           }
         }
       }
 
-      decls.push(decl.clone().fold_with(self));
+      let mut decl = decl.clone();
+      decl.visit_mut_with(self);
+      decls.push(decl);
     }
 
-    VarDecl {
+    *node = VarDecl {
       span: node.span,
       kind: node.kind,
       decls,
       declare: node.declare,
-    }
+      ctxt: node.ctxt,
+    };
   }
 }
 
 impl<'a> EnvReplacer<'a> {
+  /// If an expression matches `process.browser = ...` then the RHS is replaced with
+  /// `true` when `is_browser` is set to true.
+  ///
+  /// This likely doesn't make sense so it should be deprecated in the future.
+  fn replace_browser_assignment(&mut self, node: &Expr) -> Option<Expr> {
+    let Expr::Assign(ref assign) = node else {
+      return None;
+    };
+    let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assign.left else {
+      return None;
+    };
+
+    if !self.is_browser
+      || !match_member_expr(member, vec!["process", "browser"], self.unresolved_mark)
+    {
+      return None;
+    }
+
+    let mut res = assign.clone();
+    res.right = Box::new(Expr::Lit(Lit::Bool(Bool {
+      value: true,
+      span: DUMMY_SP,
+    })));
+    Some(Expr::Assign(res))
+  }
+
   fn replace(&mut self, sym: &JsWord, fallback_undefined: bool) -> Option<Expr> {
     if let Some(val) = self.env.get(sym) {
       self.used_env.insert(sym.clone());
       return Some(Expr::Lit(Lit::Str(Str {
         span: DUMMY_SP,
-        value: val.into(),
+        value: val.clone(),
         raw: None,
       })));
     } else if fallback_undefined {
@@ -237,7 +278,12 @@ impl<'a> EnvReplacer<'a> {
 
               decls.push(VarDeclarator {
                 span: DUMMY_SP,
-                name: *kv.value.clone().fold_with(self),
+                name: {
+                  // TODO: This can be written to run in-place to make it more efficient
+                  let mut replacement = *kv.value.clone();
+                  replacement.visit_mut_with(self);
+                  replacement
+                },
                 init: if let Some(key) = key {
                   self.replace(&key, false).map(Box::new)
                 } else {
@@ -255,7 +301,10 @@ impl<'a> EnvReplacer<'a> {
                 init: if let Some(init) = self.replace(&assign.key.sym, false) {
                   Some(Box::new(init))
                 } else {
-                  assign.value.clone().fold_with(self)
+                  // TODO: This can be written to run in-place to make it more efficient
+                  let mut replacement = assign.value.clone();
+                  replacement.visit_mut_with(self);
+                  replacement
                 },
                 definite: false,
               })
@@ -289,17 +338,391 @@ impl<'a> EnvReplacer<'a> {
     }
   }
 
-  fn emit_mutating_error(&mut self, span: swc_common::Span) {
+  fn emit_mutating_error(&mut self, span: swc_core::common::Span) {
     self.diagnostics.push(Diagnostic {
       message: "Mutating process.env is not supported".into(),
       code_highlights: Some(vec![CodeHighlight {
         message: None,
-        loc: SourceLocation::from(self.source_map, span),
+        loc: SourceLocation::from(&self.source_map, span),
       }]),
       hints: None,
       show_environment: false,
       severity: DiagnosticSeverity::SourceError,
       documentation_url: None,
     });
+  }
+}
+
+#[cfg(test)]
+mod test {
+  use crate::test_utils::{run_visit, RunTestContext, RunVisitResult};
+
+  use super::*;
+
+  fn make_env_replacer<'a>(
+    run_test_context: RunTestContext,
+    env: &'a HashMap<JsWord, JsWord>,
+    used_env: &'a mut HashSet<JsWord>,
+    diagnostics: &'a mut Vec<Diagnostic>,
+  ) -> EnvReplacer<'a> {
+    EnvReplacer {
+      replace_env: true,
+      is_browser: true,
+      env,
+      used_env,
+      source_map: run_test_context.source_map.clone(),
+      diagnostics,
+      unresolved_mark: run_test_context.unresolved_mark,
+    }
+  }
+
+  #[test]
+  fn test_replacer_disabled() {
+    let env: HashMap<JsWord, JsWord> = HashMap::new();
+    let mut used_env = HashSet::new();
+    let mut diagnostics = Vec::new();
+
+    let RunVisitResult { output_code, .. } = run_visit(
+      r#"process.browser = '1234';
+console.log('thing' in process.env);
+const isTest = process.env.IS_TEST === "true";
+const { package, IS_TEST: isTest2, ...other } = process.env;
+"#,
+      |run_test_context: RunTestContext| EnvReplacer {
+        replace_env: false,
+        is_browser: true,
+        env: &env,
+        used_env: &mut used_env,
+        source_map: run_test_context.source_map.clone(),
+        diagnostics: &mut diagnostics,
+        unresolved_mark: run_test_context.unresolved_mark,
+      },
+    );
+
+    // transforms the inline value
+    // TODO: This behaviour is wrong, nothing should be changed on this case
+    assert_eq!(
+      output_code,
+      r#"process.browser = true;
+console.log(false);
+const isTest = process.env.IS_TEST === "true";
+const { package, IS_TEST: isTest2, ...other } = process.env;
+"#,
+    );
+  }
+
+  // TODO: This behaviour should be removed and will be disabled for canary builds.
+  #[test]
+  fn test_replace_browser_assignments() {
+    let env: HashMap<JsWord, JsWord> = HashMap::new();
+    let mut used_env = HashSet::new();
+    let mut diagnostics = Vec::new();
+
+    let RunVisitResult { output_code, .. } = run_visit(
+      r#"
+process.browser = '1234';
+other = '1234';
+console.log(process.browser = false);
+console.log(other = false);
+    "#,
+      |run_test_context: RunTestContext| {
+        make_env_replacer(run_test_context, &env, &mut used_env, &mut diagnostics)
+      },
+    );
+
+    // transforms the inline value
+    assert_eq!(
+      output_code,
+      r#"process.browser = true;
+other = '1234';
+console.log(process.browser = true);
+console.log(other = false);
+"#
+    );
+    // tracks that the variable was used
+    assert_eq!(used_env, HashSet::new());
+    assert_eq!(diagnostics, vec![]);
+  }
+
+  #[test]
+  fn test_replace_env_assignments() {
+    let env: HashMap<JsWord, JsWord> = HashMap::new();
+    let mut used_env = HashSet::new();
+    let mut diagnostics = Vec::new();
+
+    let RunVisitResult { output_code, .. } = run_visit(
+      r#"
+process.env = {};
+    "#,
+      |run_test_context: RunTestContext| {
+        make_env_replacer(run_test_context, &env, &mut used_env, &mut diagnostics)
+      },
+    );
+
+    // transforms the inline value
+    assert_eq!(
+      output_code,
+      r#"process.env = {};
+"#
+    );
+    // tracks that the variable was used
+    assert_eq!(used_env, HashSet::new());
+    assert_eq!(diagnostics, vec![]);
+  }
+
+  #[test]
+  fn test_replace_env_member_assignments() {
+    let env: HashMap<JsWord, JsWord> = HashMap::new();
+    let mut used_env = HashSet::new();
+    let mut diagnostics = Vec::new();
+
+    let RunVisitResult { output_code, .. } = run_visit(
+      r#"
+process.env.PROP = 'other';
+delete process.env.PROP;
+process.env.PROP++;
+    "#,
+      |run_test_context: RunTestContext| {
+        make_env_replacer(run_test_context, &env, &mut used_env, &mut diagnostics)
+      },
+    );
+
+    // transforms the inline value
+    assert_eq!(
+      output_code,
+      r#"'other';
+true;
+undefined;
+"#
+    );
+    // tracks that the variable was used
+    assert_eq!(used_env, HashSet::from(["PROP".into()]));
+    assert_eq!(diagnostics.len(), 3);
+    assert_eq!(
+      diagnostics[0].message,
+      "Mutating process.env is not supported"
+    );
+    assert_eq!(
+      diagnostics[1].message,
+      "Mutating process.env is not supported"
+    );
+    assert_eq!(
+      diagnostics[2].message,
+      "Mutating process.env is not supported"
+    );
+  }
+
+  #[test]
+  fn test_replace_env_in_expressions() {
+    let mut env: HashMap<JsWord, JsWord> = HashMap::new();
+    let mut used_env = HashSet::new();
+    let mut diagnostics = Vec::new();
+
+    env.insert("foo".into(), "foo".into());
+
+    let RunVisitResult { output_code, .. } = run_visit(
+      r#"
+console.log(foo = process.env);
+const x = ({ foo, ...others } = process.env);
+    "#,
+      |run_test_context: RunTestContext| {
+        make_env_replacer(run_test_context, &env, &mut used_env, &mut diagnostics)
+      },
+    );
+
+    // TODO: This seems wrong as there's an extra trailing object
+    assert_eq!(
+      output_code,
+      r#"console.log(foo = {}, {});
+const x = (foo = "foo", others = {}, {});
+"#
+    );
+    // tracks that the variable was used
+    assert_eq!(used_env, HashSet::from(["foo".into()]));
+    assert_eq!(diagnostics.len(), 0);
+  }
+
+  #[test]
+  fn test_replace_process_dot_browser() {
+    let env: HashMap<JsWord, JsWord> = HashMap::new();
+    let mut used_env = HashSet::new();
+    let mut diagnostics = Vec::new();
+
+    let RunVisitResult { output_code, .. } = run_visit(
+      r#"
+console.log(process.browser);
+function run(enabled = process.browser) {}
+    "#,
+      |run_test_context: RunTestContext| {
+        make_env_replacer(run_test_context, &env, &mut used_env, &mut diagnostics)
+      },
+    );
+
+    // transforms the inline value
+    assert_eq!(
+      output_code,
+      r#"console.log(true);
+function run(enabled = true) {}
+"#
+    );
+    // tracks that the variable was used
+    assert_eq!(used_env, HashSet::new());
+    assert_eq!(diagnostics, vec![]);
+  }
+
+  #[test]
+  fn test_replace_foo_in_process_env() {
+    let mut env: HashMap<JsWord, JsWord> = HashMap::new();
+    let mut used_env = HashSet::new();
+    let mut diagnostics = Vec::new();
+
+    env.insert("thing".into(), "here".into());
+
+    let RunVisitResult { output_code, .. } = run_visit(
+      r#"
+console.log('thing' in process.env);
+console.log('other' in process.env);
+    "#,
+      |run_test_context: RunTestContext| {
+        make_env_replacer(run_test_context, &env, &mut used_env, &mut diagnostics)
+      },
+    );
+
+    // transforms the inline value
+    assert_eq!(
+      output_code,
+      r#"console.log(true);
+console.log(false);
+"#
+    );
+    // tracks that the variable was used
+    assert_eq!(used_env, HashSet::from(["thing".into(), "other".into()]));
+    assert_eq!(diagnostics, vec![]);
+  }
+
+  #[test]
+  fn test_unrelated_code_is_not_affected() {
+    let env: HashMap<JsWord, JsWord> = HashMap::new();
+    let mut used_env = HashSet::new();
+    let mut diagnostics = Vec::new();
+
+    let RunVisitResult { output_code, .. } = run_visit(
+      r#"
+const isTest = process.something;
+const version = process.env.hasOwnProperty('version');
+    "#,
+      |run_test_context: RunTestContext| {
+        make_env_replacer(run_test_context, &env, &mut used_env, &mut diagnostics)
+      },
+    );
+
+    // transforms the inline value
+    assert_eq!(
+      output_code,
+      r#"const isTest = process.something;
+const version = process.env.hasOwnProperty('version');
+"#
+    );
+    // tracks that the variable was used
+    assert_eq!(used_env, HashSet::new());
+    assert_eq!(diagnostics, vec![]);
+  }
+
+  #[test]
+  fn test_replace_env_has_the_variable() {
+    let mut env: HashMap<JsWord, JsWord> = HashMap::new();
+    let mut used_env = HashSet::new();
+    let mut diagnostics = Vec::new();
+
+    env.insert("IS_TEST".into(), "true".into());
+    env.insert("VERSION".into(), "1.2.3".into());
+    env.insert("package".into(), "parcel".into());
+
+    let RunVisitResult { output_code, .. } = run_visit(
+      r#"
+const isTest = process.env.IS_TEST === "true";
+const version = process.env['VERSION'];
+const { package, IS_TEST: isTest2 } = process.env;
+    "#,
+      |run_test_context: RunTestContext| {
+        make_env_replacer(run_test_context, &env, &mut used_env, &mut diagnostics)
+      },
+    );
+
+    // transforms the inline value
+    assert_eq!(
+      output_code,
+      r#"const isTest = "true" === "true";
+const version = "1.2.3";
+const package = "parcel", isTest2 = "true";
+"#
+    );
+    // tracks that the variable was used
+    assert_eq!(
+      used_env,
+      ["package", "IS_TEST", "VERSION"]
+        .iter()
+        .map(|s| (*s).into())
+        .collect()
+    );
+    assert_eq!(diagnostics, vec![]);
+  }
+
+  #[test]
+  fn test_replace_env_rest_spread() {
+    let mut env: HashMap<JsWord, JsWord> = HashMap::new();
+    let mut used_env = HashSet::new();
+    let mut diagnostics = Vec::new();
+
+    env.insert("package".into(), "parcel".into());
+
+    let RunVisitResult { output_code, .. } = run_visit(
+      r#"
+const { package, ...other } = process.env;
+    "#,
+      |run_test_context: RunTestContext| {
+        make_env_replacer(run_test_context, &env, &mut used_env, &mut diagnostics)
+      },
+    );
+
+    // transforms the inline value
+    assert_eq!(
+      output_code,
+      r#"const package = "parcel", other = {};
+"#
+    );
+    // tracks that the variable was used
+    assert_eq!(used_env, ["package"].iter().map(|s| (*s).into()).collect());
+    assert_eq!(diagnostics, vec![]);
+  }
+
+  #[test]
+  fn test_assign_env_to_variable() {
+    let mut env: HashMap<JsWord, JsWord> = HashMap::new();
+    let mut used_env = HashSet::new();
+    let mut diagnostics = Vec::new();
+
+    env.insert("A".into(), "A".into());
+    env.insert("B".into(), "B".into());
+    env.insert("C".into(), "C".into());
+
+    let RunVisitResult { output_code, .. } = run_visit(
+      r#"
+const env = process.env;
+    "#,
+      |run_test_context: RunTestContext| {
+        make_env_replacer(run_test_context, &env, &mut used_env, &mut diagnostics)
+      },
+    );
+
+    // transforms the inline value
+    assert_eq!(
+      output_code,
+      r#"const env = {};
+"#
+    );
+    // tracks that the variable was used
+    assert_eq!(used_env, HashSet::new());
+    assert_eq!(diagnostics, vec![]);
   }
 }

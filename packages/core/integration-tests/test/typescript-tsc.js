@@ -1,11 +1,12 @@
+// @flow
 import assert from 'assert';
 import path from 'path';
 import {
   assertBundles,
   bundle,
-  run,
   distDir,
   outputFS,
+  run,
 } from '@parcel/test-utils';
 
 const config = path.join(__dirname, '/integration/typescript-config/.parcelrc');

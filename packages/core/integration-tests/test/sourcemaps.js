@@ -424,9 +424,12 @@ describe('sourcemaps', function () {
     let sourceMap = new SourceMap('/');
     sourceMap.addVLQMap(map);
     let mapData = sourceMap.getMap();
-    assert.equal(mapData.sources.length, 3);
+    assert.equal(mapData.sources.length, 4);
 
     for (let source of mapData.sources) {
+      if (source === '<anon>') {
+        continue;
+      }
       assert(
         await inputFS.exists(path.resolve(distDir + sourceRoot + source)),
         'combining sourceRoot and sources object should resolve to the original file',
@@ -445,7 +448,7 @@ describe('sourcemaps', function () {
       source: inputs[0],
       generated: raw,
       str: 'const local',
-      generatedStr: 'const t',
+      generatedStr: 'let i',
       sourcePath: 'index.js',
     });
 
@@ -454,7 +457,7 @@ describe('sourcemaps', function () {
       source: inputs[0],
       generated: raw,
       str: 'local.a',
-      generatedStr: 't.a',
+      generatedStr: 'i.a',
       sourcePath: 'index.js',
     });
 
@@ -578,12 +581,11 @@ describe('sourcemaps', function () {
   it('should create a valid sourcemap when using the Typescript tsc transformer', async function () {
     let inputFilePath = path.join(
       __dirname,
-      '/integration/sourcemap-typescript-tsc/index.ts',
+      '/integration/sourcemap-typescript-tsc/src/index.ts',
     );
 
-    await bundle(inputFilePath);
-    let distDir = path.join(__dirname, '../dist/');
-    let filename = path.join(distDir, 'index.js');
+    let b = await bundle(inputFilePath);
+    let filename = b.getBundles()[0].filePath;
     let raw = await outputFS.readFile(filename, 'utf8');
     let mapUrlData = await loadSourceMapUrl(outputFS, filename, raw);
     if (!mapUrlData) {
@@ -599,8 +601,8 @@ describe('sourcemaps', function () {
     sourceMap.addVLQMap(map);
 
     let mapData = sourceMap.getMap();
-    assert.equal(mapData.sources.length, 1);
-    assert.deepEqual(mapData.sources, ['index.ts']);
+    assert.deepEqual(mapData.sources, ['src/index.ts']);
+    assert(map.sourcesContent.every(s => s));
 
     let input = await inputFS.readFile(
       path.join(path.dirname(filename), map.sourceRoot, map.sources[0]),
@@ -611,7 +613,7 @@ describe('sourcemaps', function () {
       source: input,
       generated: raw,
       str: 'nonExistsFunc',
-      sourcePath: 'index.ts',
+      sourcePath: 'src/index.ts',
     });
   });
 
@@ -828,12 +830,11 @@ describe('sourcemaps', function () {
     // This should actually just be `./integration/scss-sourcemap-imports/with_url.scss`
     // but this is a small bug in the extend utility of the source-map library
     assert.deepEqual(mapData.sources, [
-      'integration/scss-sourcemap-imports/style.scss',
       'integration/scss-sourcemap-imports/with_url.scss',
     ]);
 
     let input = await inputFS.readFile(
-      path.join(path.dirname(filename), map.sourceRoot, map.sources[1]),
+      path.join(path.dirname(filename), map.sourceRoot, map.sources[0]),
       'utf-8',
     );
 
@@ -1257,7 +1258,7 @@ describe('sourcemaps', function () {
       source: input,
       generated: raw,
       str: "console.log('foo')",
-      generatedStr: `console.log("foo")`,
+      generatedStr: `console.log('foo')`,
       sourcePath,
     });
 
@@ -1266,7 +1267,7 @@ describe('sourcemaps', function () {
       source: input,
       generated: raw,
       str: "console.log('bar')",
-      generatedStr: `console.log("bar")`,
+      generatedStr: `console.log('bar')`,
       sourcePath,
     });
 
@@ -1275,7 +1276,7 @@ describe('sourcemaps', function () {
       source: input,
       generated: raw,
       str: "console.log('baz')",
-      generatedStr: `console.log("baz")`,
+      generatedStr: `console.log('baz')`,
       sourcePath,
     });
 
@@ -1284,7 +1285,7 @@ describe('sourcemaps', function () {
       source: input,
       generated: raw,
       str: "console.log('idhf')",
-      generatedStr: `console.log("idhf")`,
+      generatedStr: `console.log('idhf')`,
       sourcePath,
     });
   });
@@ -1424,7 +1425,7 @@ describe('sourcemaps', function () {
       source: sourceContent,
       generated: raw,
       str: `foo = 'Lorem ipsum`,
-      generatedStr: `foo = "Lorem ipsum`,
+      generatedStr: `foo = 'Lorem ipsum`,
       sourcePath,
     });
   });

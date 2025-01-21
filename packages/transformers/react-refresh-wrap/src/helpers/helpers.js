@@ -6,13 +6,25 @@ function debounce(func, delay) {
       func.call(null, args);
     };
   } else {
-    var timeout = undefined;
+    let timeout = undefined;
+    let lastTime = 0;
     return function (args) {
-      clearTimeout(timeout);
-      timeout = setTimeout(function () {
-        timeout = undefined;
+      // Call immediately if last call was more than the delay ago.
+      // Otherwise, set a timeout. This means the first call is fast
+      // (for the common case of a single update), and subsequent updates
+      // are batched.
+      let now = Date.now();
+      if (now - lastTime > delay) {
+        lastTime = now;
         func.call(null, args);
-      }, delay);
+      } else {
+        clearTimeout(timeout);
+        timeout = setTimeout(function () {
+          timeout = undefined;
+          lastTime = Date.now();
+          func.call(null, args);
+        }, delay);
+      }
     };
   }
 }
@@ -20,18 +32,52 @@ var enqueueUpdate = debounce(function () {
   Refresh.performReactRefresh();
 }, 30);
 
-// Everthing below is either adapted or copied from
+module.exports.init = function () {
+  if (!globalThis.$RefreshReg$) {
+    Refresh.injectIntoGlobalHook(globalThis);
+    globalThis.$RefreshReg$ = function () {};
+    globalThis.$RefreshSig$ = function () {
+      return function (type) {
+        return type;
+      };
+    };
+
+    if (typeof window !== 'undefined') {
+      let ErrorOverlay = require('react-error-overlay');
+      ErrorOverlay.setEditorHandler(function editorHandler(errorLocation) {
+        let file = `${errorLocation.fileName}:${
+          errorLocation.lineNumber || 1
+        }:${errorLocation.colNumber || 1}`;
+        fetch(`/__parcel_launch_editor?file=${encodeURIComponent(file)}`);
+      });
+
+      ErrorOverlay.startReportingRuntimeErrors({
+        onError: function () {},
+      });
+
+      window.addEventListener('parcelhmraccept', () => {
+        ErrorOverlay.dismissRuntimeErrors();
+      });
+    }
+  }
+};
+
+// Everything below is either adapted or copied from
 // https://github.com/facebook/metro/blob/61de16bd1edd7e738dd0311c89555a644023ab2d/packages/metro/src/lib/polyfills/require.js
 // MIT License - Copyright (c) Facebook, Inc. and its affiliates.
 
 module.exports.prelude = function (module) {
-  window.$RefreshReg$ = function (type, id) {
+  globalThis.$RefreshReg$ = function (type, id) {
     Refresh.register(type, module.id + ' ' + id);
   };
-  window.$RefreshSig$ = Refresh.createSignatureFunctionForTransform;
+  globalThis.$RefreshSig$ = Refresh.createSignatureFunctionForTransform;
 };
 
 module.exports.postlude = function (module) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
   if (isReactRefreshBoundary(module.exports)) {
     registerExportsForReactRefresh(module);
 
