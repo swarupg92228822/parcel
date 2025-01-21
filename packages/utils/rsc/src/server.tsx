@@ -1,3 +1,4 @@
+/* @jsxRuntime automatic */
 import type { ErrorInfo } from 'react-dom/client';
 
 // Server dependencies.

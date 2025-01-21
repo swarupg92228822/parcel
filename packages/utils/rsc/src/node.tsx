@@ -1,3 +1,4 @@
+/* @jsxRuntime automatic */
 import type { IncomingMessage, ServerResponse } from 'http';
 import type { ReadableStream as NodeReadableStream } from 'stream/web';
 
